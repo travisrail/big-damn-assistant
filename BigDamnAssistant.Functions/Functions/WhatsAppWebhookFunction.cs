@@ -90,7 +90,7 @@ public class WhatsAppWebhookFunction
 
             if (string.IsNullOrEmpty(from))
             {
-                _logger.LogWarning("Missing From in WhatsApp webhook");
+                _logger.LogDebug("Ignoring callback with no From field (likely delivery status)");
                 return okResponse;
             }
 
