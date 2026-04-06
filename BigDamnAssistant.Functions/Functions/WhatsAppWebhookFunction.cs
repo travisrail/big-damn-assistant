@@ -59,6 +59,13 @@ public class WhatsAppWebhookFunction
                 return okResponse;
             }
 
+            // Ignore Twilio delivery status callbacks (no Body, has MessageStatus/SmsStatus)
+            if (!string.IsNullOrEmpty(formData["MessageStatus"]) || !string.IsNullOrEmpty(formData["SmsStatus"]))
+            {
+                _logger.LogDebug("Ignoring Twilio status callback: {Status}", formData["MessageStatus"] ?? formData["SmsStatus"]);
+                return okResponse;
+            }
+
             // Detect channel from Twilio To field
             var to = formData["To"] ?? string.Empty;
             var channel = to.StartsWith("whatsapp:", StringComparison.OrdinalIgnoreCase)
