@@ -23,6 +23,8 @@ public class ClaudeService : IClaudeService
     private readonly IFamilyMemoryRepository _familyMemoryRepository;
     private readonly IEmailMonitoringRepository _emailMonitoringRepository;
     private readonly IMemberPreferencesRepository _memberPreferencesRepository;
+    private readonly IFamilyProfileRepository _familyProfileRepository;
+    private readonly IKidSmsRepository _kidSmsRepository;
     private readonly IFunContentService _funContentService;
     private readonly IAffirmationRepository _affirmationRepository;
     private readonly IFeatureRequestRepository _featureRequestRepository;
@@ -42,6 +44,8 @@ public class ClaudeService : IClaudeService
         IFamilyMemoryRepository familyMemoryRepository,
         IEmailMonitoringRepository emailMonitoringRepository,
         IMemberPreferencesRepository memberPreferencesRepository,
+        IFamilyProfileRepository familyProfileRepository,
+        IKidSmsRepository kidSmsRepository,
         IFunContentService funContentService,
         IAffirmationRepository affirmationRepository,
         IFeatureRequestRepository featureRequestRepository,
@@ -56,6 +60,8 @@ public class ClaudeService : IClaudeService
         _familyMemoryRepository = familyMemoryRepository;
         _emailMonitoringRepository = emailMonitoringRepository;
         _memberPreferencesRepository = memberPreferencesRepository;
+        _familyProfileRepository = familyProfileRepository;
+        _kidSmsRepository = kidSmsRepository;
         _funContentService = funContentService;
         _affirmationRepository = affirmationRepository;
         _featureRequestRepository = featureRequestRepository;
@@ -74,10 +80,11 @@ public class ClaudeService : IClaudeService
         var client = _httpClientFactory.CreateClient("Claude");
         var now = TimeZoneInfo.ConvertTimeBySystemTimeZoneId(DateTimeOffset.UtcNow, member.Timezone);
 
-        // Load family memories and member preferences for system prompt injection
+        // Load family memories, member preferences, and family profiles for system prompt injection
         var memories = await _familyMemoryRepository.GetAllAsync(cancellationToken);
         var preferences = await _memberPreferencesRepository.GetAsync(member.PhoneNumber, cancellationToken);
-        var systemPrompt = BuildSystemPrompt(member, now, memories, preferences, history.SessionSummaries);
+        var profiles = await _familyProfileRepository.GetAllActiveAsync(cancellationToken);
+        var systemPrompt = BuildSystemPrompt(member, now, memories, preferences, history.SessionSummaries, profiles);
         var messages = BuildMessages(history, userMessage);
         var tools = BuildToolDefinitions();
 
@@ -136,6 +143,85 @@ public class ClaudeService : IClaudeService
         return "I got a bit lost working on that. Can you try asking again?";
     }
 
+    public async Task<string> GetKidResponseAsync(
+        KidSmsUser kid,
+        FamilyProfile profile,
+        ConversationHistory history,
+        string userMessage,
+        CancellationToken cancellationToken = default)
+    {
+        _currentMember = null;
+        _currentConversation = history;
+        var client = _httpClientFactory.CreateClient("Claude");
+        var now = TimeZoneInfo.ConvertTimeBySystemTimeZoneId(DateTimeOffset.UtcNow, "America/Chicago");
+
+        var systemPrompt = BuildKidSystemPrompt(kid, profile, now);
+        var messages = BuildMessages(history, userMessage);
+        var tools = BuildKidToolDefinitions();
+
+        for (var round = 0; round < MaxToolRounds; round++)
+        {
+            var request = new ClaudeRequest
+            {
+                Model = Model,
+                MaxTokens = 256,
+                System = systemPrompt,
+                Messages = messages,
+                Tools = tools
+            };
+
+            try
+            {
+                var response = await client.PostAsJsonAsync(ApiUrl, request, cancellationToken);
+                response.EnsureSuccessStatusCode();
+
+                var result = await response.Content.ReadFromJsonAsync<ClaudeResponse>(cancellationToken: cancellationToken);
+
+                if (result?.StopReason == "tool_use" && result.Content != null)
+                {
+                    messages.Add(new ClaudeMessage { Role = "assistant", Content = result.Content });
+
+                    var toolResults = new List<object>();
+                    foreach (var block in result.Content.Where(b => b.Type == "tool_use"))
+                    {
+                        _logger.LogInformation("Kid Claude calling tool: {ToolName}", block.Name);
+                        var toolResult = await ExecuteToolAsync(block.Name!, block.Id!, block.Input, "America/Chicago", cancellationToken);
+                        toolResults.Add(toolResult);
+                    }
+
+                    messages.Add(new ClaudeMessage { Role = "user", Content = toolResults });
+                    continue;
+                }
+
+                var text = result?.Content?.FirstOrDefault(b => b.Type == "text")?.Text;
+
+                if (string.IsNullOrEmpty(text))
+                    return "Hmm, I got stuck. Try asking again!";
+
+                return TruncateToSentences(text, 3);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Claude API call failed for kid {KidName}", kid.DisplayName);
+                return "Oops, I got confused. Try again in a sec!";
+            }
+        }
+
+        return "I got a bit lost. Can you ask me again?";
+    }
+
+    private static string TruncateToSentences(string text, int maxSentences)
+    {
+        var sentences = text.Split(new[] { ". ", "! ", "? " }, StringSplitOptions.RemoveEmptyEntries);
+        if (sentences.Length <= maxSentences)
+            return text;
+
+        var result = string.Join(". ", sentences.Take(maxSentences));
+        if (!result.EndsWith('.') && !result.EndsWith('!') && !result.EndsWith('?'))
+            result += ".";
+        return result;
+    }
+
     private async Task<object> ExecuteToolAsync(string toolName, string toolId, JsonElement? input, string memberTimezone, CancellationToken cancellationToken)
     {
         try
@@ -168,6 +254,14 @@ public class ClaudeService : IClaudeService
                 "set_preference" => await HandleSetPreference(input, cancellationToken),
                 "list_preferences" => await HandleListPreferences(cancellationToken),
                 "remove_preference" => await HandleRemovePreference(input, cancellationToken),
+                "create_family_profile" => await HandleCreateFamilyProfile(input, cancellationToken),
+                "update_family_profile" => await HandleUpdateFamilyProfile(input, cancellationToken),
+                "view_family_profile" => await HandleViewFamilyProfile(input, cancellationToken),
+                "list_family_profiles" => await HandleListFamilyProfiles(cancellationToken),
+                "deactivate_family_profile" => await HandleDeactivateFamilyProfile(input, cancellationToken),
+                "register_kid_contact" => await HandleRegisterKidContact(input, cancellationToken),
+                "update_kid_channel" => await HandleUpdateKidChannel(input, cancellationToken),
+                "send_kid_alert" => await HandleSendKidAlert(input, cancellationToken),
                 _ => $"Unknown tool: {toolName}"
             };
 
@@ -869,6 +963,237 @@ public class ClaudeService : IClaudeService
 
     #endregion
 
+    #region Family Profile Tools
+
+    private async Task<string> HandleCreateFamilyProfile(JsonElement? input, CancellationToken cancellationToken)
+    {
+        var name = input?.GetProperty("name").GetString() ?? "";
+        if (string.IsNullOrEmpty(name)) return "Error: 'name' is required.";
+
+        var existing = await _familyProfileRepository.GetByNameAsync(name, cancellationToken);
+        if (existing != null) return $"A profile for '{name}' already exists. Use update_family_profile to modify it.";
+
+        var profile = new FamilyProfile
+        {
+            Name = name,
+            AddedBy = _currentMember?.PhoneNumber ?? ""
+        };
+
+        if (input?.TryGetProperty("age", out var age) == true) profile.Age = age.GetInt32();
+        if (input?.TryGetProperty("profile_type", out var pt) == true) profile.ProfileType = pt.GetString() ?? "child";
+        if (input?.TryGetProperty("date_of_birth", out var dob) == true) profile.DateOfBirth = dob.GetString();
+        if (input?.TryGetProperty("school", out var school) == true) profile.School = school.GetString() ?? "";
+        if (input?.TryGetProperty("grade", out var grade) == true) profile.Grade = grade.GetString() ?? "";
+
+        await _familyProfileRepository.UpsertAsync(profile, cancellationToken);
+        _logger.LogInformation("Created family profile for {Name}", name);
+        return $"Created profile for {name}.";
+    }
+
+    private async Task<string> HandleUpdateFamilyProfile(JsonElement? input, CancellationToken cancellationToken)
+    {
+        var name = input?.GetProperty("name").GetString() ?? "";
+        if (string.IsNullOrEmpty(name)) return "Error: 'name' is required.";
+
+        var profile = await _familyProfileRepository.GetByNameAsync(name, cancellationToken);
+        if (profile == null) return $"No profile found for '{name}'. Create one first with create_family_profile.";
+
+        if (input?.TryGetProperty("age", out var age) == true) profile.Age = age.GetInt32();
+        if (input?.TryGetProperty("school", out var school) == true) profile.School = school.GetString() ?? "";
+        if (input?.TryGetProperty("grade", out var grade) == true) profile.Grade = grade.GetString() ?? "";
+        if (input?.TryGetProperty("teacher", out var teacher) == true) profile.Teacher = teacher.GetString() ?? "";
+        if (input?.TryGetProperty("doctor_name", out var doc) == true) profile.DoctorName = doc.GetString() ?? "";
+        if (input?.TryGetProperty("emergency_contact", out var ec) == true) profile.EmergencyContact = ec.GetString() ?? "";
+        if (input?.TryGetProperty("medical_notes", out var mn) == true) profile.MedicalNotes = mn.GetString() ?? "";
+        if (input?.TryGetProperty("notes", out var notes) == true) profile.Notes = notes.GetString() ?? "";
+        if (input?.TryGetProperty("date_of_birth", out var dob) == true) profile.DateOfBirth = dob.GetString();
+
+        if (input?.TryGetProperty("add_allergy", out var allergy) == true)
+        {
+            var val = allergy.GetString();
+            if (!string.IsNullOrEmpty(val) && !profile.Allergies.Contains(val, StringComparer.OrdinalIgnoreCase))
+                profile.Allergies.Add(val);
+        }
+        if (input?.TryGetProperty("add_like", out var like) == true)
+        {
+            var val = like.GetString();
+            if (!string.IsNullOrEmpty(val) && !profile.Likes.Contains(val, StringComparer.OrdinalIgnoreCase))
+                profile.Likes.Add(val);
+        }
+        if (input?.TryGetProperty("add_dislike", out var dislike) == true)
+        {
+            var val = dislike.GetString();
+            if (!string.IsNullOrEmpty(val) && !profile.Dislikes.Contains(val, StringComparer.OrdinalIgnoreCase))
+                profile.Dislikes.Add(val);
+        }
+        if (input?.TryGetProperty("add_nickname", out var nick) == true)
+        {
+            var val = nick.GetString();
+            if (!string.IsNullOrEmpty(val) && !profile.Nicknames.Contains(val, StringComparer.OrdinalIgnoreCase))
+                profile.Nicknames.Add(val);
+        }
+        if (input?.TryGetProperty("add_activity", out var activityEl) == true)
+        {
+            var activity = new FamilyActivity
+            {
+                Name = activityEl.TryGetProperty("name", out var an) ? an.GetString() ?? "" : "",
+                DayOfWeek = activityEl.TryGetProperty("day_of_week", out var dw) ? dw.GetString() ?? "" : "",
+                Time = activityEl.TryGetProperty("time", out var t) ? t.GetString() ?? "" : "",
+                Location = activityEl.TryGetProperty("location", out var l) ? l.GetString() ?? "" : ""
+            };
+            if (!string.IsNullOrEmpty(activity.Name))
+                profile.Activities.Add(activity);
+        }
+        if (input?.TryGetProperty("remove_activity", out var removeAct) == true)
+        {
+            var actName = removeAct.GetString();
+            if (!string.IsNullOrEmpty(actName))
+                profile.Activities.RemoveAll(a => a.Name.Equals(actName, StringComparison.OrdinalIgnoreCase));
+        }
+
+        profile.UpdatedAt = DateTime.UtcNow;
+        await _familyProfileRepository.UpsertAsync(profile, cancellationToken);
+        return $"Updated profile for {name}.";
+    }
+
+    private async Task<string> HandleViewFamilyProfile(JsonElement? input, CancellationToken cancellationToken)
+    {
+        var name = input?.GetProperty("name").GetString() ?? "";
+        if (string.IsNullOrEmpty(name)) return "Error: 'name' is required.";
+
+        var profile = await _familyProfileRepository.GetByNameAsync(name, cancellationToken);
+        if (profile == null) return $"No profile found for '{name}'.";
+
+        return JsonSerializer.Serialize(profile);
+    }
+
+    private async Task<string> HandleListFamilyProfiles(CancellationToken cancellationToken)
+    {
+        var profiles = await _familyProfileRepository.GetAllActiveAsync(cancellationToken);
+        if (profiles.Count == 0) return "No family profiles found.";
+
+        return JsonSerializer.Serialize(profiles.Select(p => new
+        {
+            name = p.Name,
+            age = p.Age,
+            profileType = p.ProfileType,
+            school = p.School,
+            activitiesCount = p.Activities.Count
+        }));
+    }
+
+    private async Task<string> HandleDeactivateFamilyProfile(JsonElement? input, CancellationToken cancellationToken)
+    {
+        var name = input?.GetProperty("name").GetString() ?? "";
+        if (string.IsNullOrEmpty(name)) return "Error: 'name' is required.";
+
+        var removed = await _familyProfileRepository.DeactivateAsync(name, cancellationToken);
+        return removed ? $"Removed profile for {name}." : $"No profile found for '{name}'.";
+    }
+
+    #endregion
+
+    #region Kid Contact Tools
+
+    private async Task<string> HandleRegisterKidContact(JsonElement? input, CancellationToken cancellationToken)
+    {
+        var profileName = input?.GetProperty("profile_name").GetString() ?? "";
+        var smsNumber = input?.TryGetProperty("sms_number", out var sms) == true ? sms.GetString() : null;
+        var whatsAppNumber = input?.TryGetProperty("whatsapp_number", out var wa) == true ? wa.GetString() : null;
+
+        if (string.IsNullOrEmpty(profileName)) return "Error: 'profile_name' is required.";
+        if (string.IsNullOrEmpty(smsNumber) && string.IsNullOrEmpty(whatsAppNumber))
+            return "Error: at least one of 'sms_number' or 'whatsapp_number' is required.";
+
+        var profile = await _familyProfileRepository.GetByNameAsync(profileName, cancellationToken);
+        if (profile == null) return $"No family profile found for '{profileName}'. Create one first.";
+
+        var existing = await _kidSmsRepository.GetByProfileNameAsync(profileName, cancellationToken);
+        var kid = existing ?? new KidSmsUser
+        {
+            Id = $"kidsms-{smsNumber ?? whatsAppNumber}",
+            LinkedProfileName = profileName,
+            DisplayName = profile.Name,
+            AddedBy = _currentMember?.PhoneNumber ?? ""
+        };
+
+        if (!string.IsNullOrEmpty(smsNumber)) kid.SmsPhoneNumber = smsNumber;
+        if (!string.IsNullOrEmpty(whatsAppNumber))
+        {
+            kid.WhatsAppPhoneNumber = whatsAppNumber;
+            kid.PreferredChannel = "WhatsApp";
+        }
+
+        kid.UpdatedAt = DateTime.UtcNow;
+        await _kidSmsRepository.UpsertAsync(kid, cancellationToken);
+        _logger.LogInformation("Registered kid contact for {ProfileName}", profileName);
+
+        var channels = new List<string>();
+        if (!string.IsNullOrEmpty(kid.SmsPhoneNumber)) channels.Add($"SMS: {kid.SmsPhoneNumber}");
+        if (!string.IsNullOrEmpty(kid.WhatsAppPhoneNumber)) channels.Add($"WhatsApp: {kid.WhatsAppPhoneNumber}");
+        return $"Registered contact for {profile.Name}. Channels: {string.Join(", ", channels)}. Preferred: {kid.PreferredChannel}.";
+    }
+
+    private async Task<string> HandleUpdateKidChannel(JsonElement? input, CancellationToken cancellationToken)
+    {
+        var profileName = input?.GetProperty("profile_name").GetString() ?? "";
+        if (string.IsNullOrEmpty(profileName)) return "Error: 'profile_name' is required.";
+
+        var kid = await _kidSmsRepository.GetByProfileNameAsync(profileName, cancellationToken);
+        if (kid == null) return $"No contact record found for '{profileName}'. Register one first.";
+
+        if (input?.TryGetProperty("preferred_channel", out var pc) == true)
+            kid.PreferredChannel = pc.GetString() ?? kid.PreferredChannel;
+        if (input?.TryGetProperty("sms_number", out var sms) == true)
+            kid.SmsPhoneNumber = sms.GetString();
+        if (input?.TryGetProperty("whatsapp_number", out var wa) == true)
+            kid.WhatsAppPhoneNumber = wa.GetString();
+
+        kid.UpdatedAt = DateTime.UtcNow;
+        await _kidSmsRepository.UpsertAsync(kid, cancellationToken);
+        return $"Updated contact settings for {kid.DisplayName}. Preferred channel: {kid.PreferredChannel}.";
+    }
+
+    private async Task<string> HandleSendKidAlert(JsonElement? input, CancellationToken cancellationToken)
+    {
+        var profileName = input?.GetProperty("profile_name").GetString() ?? "";
+        var message = input?.GetProperty("message").GetString() ?? "";
+
+        if (string.IsNullOrEmpty(profileName)) return "Error: 'profile_name' is required.";
+        if (string.IsNullOrEmpty(message)) return "Error: 'message' is required.";
+
+        var kid = await _kidSmsRepository.GetByProfileNameAsync(profileName, cancellationToken);
+        if (kid == null) return $"No contact record found for '{profileName}'. Register their number first.";
+
+        string? deliveryNumber = null;
+        var channelUsed = kid.PreferredChannel;
+
+        if (kid.PreferredChannel == "WhatsApp" && !string.IsNullOrEmpty(kid.WhatsAppPhoneNumber))
+            deliveryNumber = kid.WhatsAppPhoneNumber;
+        else if (!string.IsNullOrEmpty(kid.SmsPhoneNumber))
+        {
+            deliveryNumber = kid.SmsPhoneNumber;
+            channelUsed = "SMS";
+        }
+        else if (!string.IsNullOrEmpty(kid.WhatsAppPhoneNumber))
+        {
+            deliveryNumber = kid.WhatsAppPhoneNumber;
+            channelUsed = "WhatsApp";
+        }
+
+        if (deliveryNumber == null)
+            return $"No delivery channel available for {kid.DisplayName}. Register a phone number first.";
+
+        var channel = channelUsed == "WhatsApp" ? MessageChannel.WhatsApp : MessageChannel.SMS;
+        await _whatsAppService.SendOnChannelAsync(deliveryNumber, channel, message, cancellationToken);
+
+        _logger.LogInformation("Sent kid alert to {KidName} via {Channel}", kid.DisplayName, channelUsed);
+        var channelDesc = channelUsed == "SMS" ? $"Texted {kid.DisplayName}'s watch" : $"Sent {kid.DisplayName} a message on WhatsApp";
+        return $"{channelDesc}: \"{message}\"";
+    }
+
+    #endregion
+
     private static List<object> BuildToolDefinitions()
     {
         return new List<object>
@@ -1229,6 +1554,229 @@ public class ClaudeService : IClaudeService
             },
             new
             {
+                name = "create_family_profile",
+                description = "Create a profile for a family member who doesn't use BDA directly (kids, pets). Use when an adult says 'add family profile for...' or 'add Teddy, age 8'.",
+                input_schema = new
+                {
+                    type = "object",
+                    properties = new Dictionary<string, object>
+                    {
+                        ["name"] = new { type = "string", description = "Name of the family member" },
+                        ["age"] = new { type = "integer", description = "Age (optional)" },
+                        ["profile_type"] = new { type = "string", description = "Type: child, pet, or other (default: child)" },
+                        ["date_of_birth"] = new { type = "string", description = "Date of birth in ISO format (optional)" },
+                        ["school"] = new { type = "string", description = "School name (optional)" },
+                        ["grade"] = new { type = "string", description = "Grade level (optional)" }
+                    },
+                    required = new[] { "name" }
+                }
+            },
+            new
+            {
+                name = "update_family_profile",
+                description = "Update a family profile. Use for any profile detail: teacher, allergies, likes, dislikes, activities, school, grade, medical notes, etc. Call once per distinct update field.",
+                input_schema = new
+                {
+                    type = "object",
+                    properties = new Dictionary<string, object>
+                    {
+                        ["name"] = new { type = "string", description = "Name of the family member to update" },
+                        ["age"] = new { type = "integer" },
+                        ["school"] = new { type = "string" },
+                        ["grade"] = new { type = "string" },
+                        ["teacher"] = new { type = "string" },
+                        ["doctor_name"] = new { type = "string" },
+                        ["emergency_contact"] = new { type = "string" },
+                        ["medical_notes"] = new { type = "string" },
+                        ["notes"] = new { type = "string" },
+                        ["date_of_birth"] = new { type = "string" },
+                        ["add_allergy"] = new { type = "string", description = "Add an allergy" },
+                        ["add_like"] = new { type = "string", description = "Add a like/interest" },
+                        ["add_dislike"] = new { type = "string", description = "Add a dislike" },
+                        ["add_nickname"] = new { type = "string", description = "Add a nickname" },
+                        ["add_activity"] = new { type = "object", properties = new Dictionary<string, object>
+                        {
+                            ["name"] = new { type = "string" },
+                            ["day_of_week"] = new { type = "string" },
+                            ["time"] = new { type = "string" },
+                            ["location"] = new { type = "string" }
+                        }},
+                        ["remove_activity"] = new { type = "string", description = "Remove an activity by name" }
+                    },
+                    required = new[] { "name" }
+                }
+            },
+            new
+            {
+                name = "view_family_profile",
+                description = "View the full profile for a family member.",
+                input_schema = new
+                {
+                    type = "object",
+                    properties = new Dictionary<string, object>
+                    {
+                        ["name"] = new { type = "string", description = "Name of the family member" }
+                    },
+                    required = new[] { "name" }
+                }
+            },
+            new
+            {
+                name = "list_family_profiles",
+                description = "List all family profiles.",
+                input_schema = new
+                {
+                    type = "object",
+                    properties = new Dictionary<string, object>(),
+                    required = Array.Empty<string>()
+                }
+            },
+            new
+            {
+                name = "deactivate_family_profile",
+                description = "Remove/deactivate a family profile.",
+                input_schema = new
+                {
+                    type = "object",
+                    properties = new Dictionary<string, object>
+                    {
+                        ["name"] = new { type = "string", description = "Name of the family member" }
+                    },
+                    required = new[] { "name" }
+                }
+            },
+            new
+            {
+                name = "register_kid_contact",
+                description = "Register a kid's contact number (SMS watch or WhatsApp) and link it to their family profile. This allows the kid to interact with BDA.",
+                input_schema = new
+                {
+                    type = "object",
+                    properties = new Dictionary<string, object>
+                    {
+                        ["profile_name"] = new { type = "string", description = "Name matching a family profile" },
+                        ["sms_number"] = new { type = "string", description = "SMS phone number in E.164 format (watch number)" },
+                        ["whatsapp_number"] = new { type = "string", description = "WhatsApp number in E.164 format" }
+                    },
+                    required = new[] { "profile_name" }
+                }
+            },
+            new
+            {
+                name = "update_kid_channel",
+                description = "Update a kid's contact settings — preferred channel, SMS number, or WhatsApp number.",
+                input_schema = new
+                {
+                    type = "object",
+                    properties = new Dictionary<string, object>
+                    {
+                        ["profile_name"] = new { type = "string", description = "Name matching a family profile" },
+                        ["preferred_channel"] = new { type = "string", description = "SMS or WhatsApp" },
+                        ["sms_number"] = new { type = "string", description = "New SMS number" },
+                        ["whatsapp_number"] = new { type = "string", description = "New WhatsApp number" }
+                    },
+                    required = new[] { "profile_name" }
+                }
+            },
+            new
+            {
+                name = "send_kid_alert",
+                description = "Send a message to a kid on their preferred channel. Use when an adult says 'text Teddy that...' or 'send Emma a reminder...'.",
+                input_schema = new
+                {
+                    type = "object",
+                    properties = new Dictionary<string, object>
+                    {
+                        ["profile_name"] = new { type = "string", description = "Name matching a family profile" },
+                        ["message"] = new { type = "string", description = "The message to send (keep it short and kid-friendly)" }
+                    },
+                    required = new[] { "profile_name", "message" }
+                }
+            },
+            new
+            {
+                type = "web_search_20250305",
+                name = "web_search",
+                max_uses = 3
+            }
+        };
+    }
+
+    private static List<object> BuildKidToolDefinitions()
+    {
+        return new List<object>
+        {
+            new
+            {
+                name = "get_calendar_events",
+                description = "Get calendar events for a date range.",
+                input_schema = new
+                {
+                    type = "object",
+                    properties = new Dictionary<string, object>
+                    {
+                        ["from"] = new { type = "string", description = "Start date/time in ISO 8601 format" },
+                        ["to"] = new { type = "string", description = "End date/time in ISO 8601 format" }
+                    },
+                    required = new[] { "from", "to" }
+                }
+            },
+            new
+            {
+                name = "send_joke",
+                description = "Send a joke to a family member.",
+                input_schema = new
+                {
+                    type = "object",
+                    properties = new Dictionary<string, object>
+                    {
+                        ["recipient_name"] = new { type = "string", description = "Name or nickname of the family member" }
+                    },
+                    required = new[] { "recipient_name" }
+                }
+            },
+            new
+            {
+                name = "send_fun_fact",
+                description = "Send a fun fact to a family member.",
+                input_schema = new
+                {
+                    type = "object",
+                    properties = new Dictionary<string, object>
+                    {
+                        ["recipient_name"] = new { type = "string", description = "Name or nickname" },
+                        ["topic"] = new { type = "string", description = "Topic for the fact (optional)" }
+                    },
+                    required = new[] { "recipient_name" }
+                }
+            },
+            new
+            {
+                name = "add_feature_request",
+                description = "Submit an idea for BDA improvements.",
+                input_schema = new
+                {
+                    type = "object",
+                    properties = new Dictionary<string, object>
+                    {
+                        ["description"] = new { type = "string", description = "The feature idea" }
+                    },
+                    required = new[] { "description" }
+                }
+            },
+            new
+            {
+                name = "list_memories",
+                description = "List saved family memories.",
+                input_schema = new
+                {
+                    type = "object",
+                    properties = new Dictionary<string, object>(),
+                    required = Array.Empty<string>()
+                }
+            },
+            new
+            {
                 type = "web_search_20250305",
                 name = "web_search",
                 max_uses = 3
@@ -1241,7 +1789,8 @@ public class ClaudeService : IClaudeService
         DateTimeOffset localNow,
         IReadOnlyList<FamilyMemory>? memories = null,
         MemberPreferences? preferences = null,
-        IReadOnlyList<SessionSummary>? sessionSummaries = null)
+        IReadOnlyList<SessionSummary>? sessionSummaries = null,
+        IReadOnlyList<FamilyProfile>? profiles = null)
     {
         var prompt = $"""
             You are {_assistantOptions.Name}, a helpful family AI assistant.
@@ -1272,6 +1821,8 @@ public class ClaudeService : IClaudeService
             Family members can add affirmations to a shared pool used in morning briefings. Use the affirmation tools when asked to add, remove, or list affirmations.
             When a family member asks to clear their chat, start fresh, reset the conversation, or forget what was discussed, use the clear_conversation tool. Reassure them that family memories are not affected.
             Family members can set, view, and remove personal preferences using the preference tools. When someone says "set my briefing to short", "I prefer detailed responses", "don't message me before 8am", "I'm vegetarian", etc., use set_preference. When they ask to see their preferences, use list_preferences. When they ask to forget a preference, use remove_preference.
+            You can manage family profiles for kids and other non-user family members. Use create_family_profile to add a new profile, update_family_profile to modify details (teacher, allergies, likes, activities, etc.), view_family_profile to see full details, and list_family_profiles to see all profiles. When an adult mentions something about a kid's schedule, teacher, allergies, or interests, update the appropriate profile. For multi-field updates like "Teddy likes Minecraft and hates broccoli", call update_family_profile multiple times (once per field).
+            You can register kids' contact numbers (SMS watches or WhatsApp) using register_kid_contact, update their preferred communication channel with update_kid_channel, and send them direct messages with send_kid_alert. When an adult says "text Teddy that..." or "send Emma a reminder...", use send_kid_alert.
             Be warm, concise, and practical. You are not a chatbot — you are a capable assistant.
             """;
 
@@ -1315,6 +1866,46 @@ public class ClaudeService : IClaudeService
             }
         }
 
+        // Family profiles
+        if (profiles != null && profiles.Count > 0)
+        {
+            prompt += "\n\n## Family Profiles\nThe following are profiles for family members who do not use BDA directly:\n\n";
+            foreach (var p in profiles)
+            {
+                prompt += $"**{p.Name}";
+                if (p.Age.HasValue) prompt += $" (age {p.Age})";
+                prompt += "**\n";
+                if (!string.IsNullOrEmpty(p.School))
+                {
+                    prompt += $"School: {p.School}";
+                    if (!string.IsNullOrEmpty(p.Grade)) prompt += $", {p.Grade}";
+                    if (!string.IsNullOrEmpty(p.Teacher)) prompt += $", Teacher: {p.Teacher}";
+                    prompt += "\n";
+                }
+                if (p.Allergies.Count > 0) prompt += $"Allergies: {string.Join(", ", p.Allergies)}\n";
+                if (p.Likes.Count > 0 || p.Dislikes.Count > 0)
+                {
+                    var parts = new List<string>();
+                    if (p.Likes.Count > 0) parts.Add($"Likes: {string.Join(", ", p.Likes)}");
+                    if (p.Dislikes.Count > 0) parts.Add($"Dislikes: {string.Join(", ", p.Dislikes)}");
+                    prompt += string.Join(" | ", parts) + "\n";
+                }
+                if (p.Activities.Count > 0)
+                {
+                    var acts = p.Activities.Select(a =>
+                    {
+                        var desc = $"{a.Name} ({a.DayOfWeek}s {a.Time}";
+                        if (!string.IsNullOrEmpty(a.Location)) desc += $", {a.Location}";
+                        desc += ")";
+                        return desc;
+                    });
+                    prompt += $"Activities: {string.Join(", ", acts)}\n";
+                }
+                if (!string.IsNullOrEmpty(p.Notes)) prompt += $"Notes: {p.Notes}\n";
+                prompt += "\n";
+            }
+        }
+
         // Session summaries
         if (sessionSummaries != null && sessionSummaries.Count > 0)
         {
@@ -1324,6 +1915,55 @@ public class ClaudeService : IClaudeService
                 prompt += $"**{summary.SessionDate:MMMM d, yyyy}** ({summary.MessageCount} messages):\n{summary.Summary}\n\n";
             }
         }
+
+        return prompt;
+    }
+
+    public string BuildKidSystemPrompt(KidSmsUser kid, FamilyProfile profile, DateTimeOffset localNow)
+    {
+        var prompt = $"""
+            You are {_assistantOptions.Name}, a friendly and helpful family assistant.
+            You are currently talking with {kid.DisplayName}, who is {profile.Age?.ToString() ?? "a kid"} years old.
+            Today is {localNow:dddd, MMMM d, yyyy}. Local time is {localNow:h:mm tt} CT.
+
+            You are talking over SMS on a kids smartwatch — keep ALL responses SHORT (3 sentences maximum) because the screen is tiny.
+
+            IMPORTANT CONTENT RULES — follow these strictly:
+            - Language must be age-appropriate for a child under 13 at all times
+            - Never discuss violence, adult themes, relationships, or anything inappropriate for children
+            - Keep responses positive, encouraging, and fun
+            - If asked anything inappropriate, respond: "That's not something I can help with — ask a mom or dad!"
+            - Do not discuss other family members' personal details
+            - Do not reveal family memory contents beyond what directly helps {kid.DisplayName}
+
+            FORMATTING: SMS on a kids watch has a tiny screen. Maximum 3 sentences. No markdown. Plain text only. Simple words.
+            """;
+
+        // Profile summary
+        prompt += $"\n\nWhat you know about {kid.DisplayName}:\n";
+        if (!string.IsNullOrEmpty(profile.School))
+        {
+            prompt += $"School: {profile.School}";
+            if (!string.IsNullOrEmpty(profile.Grade)) prompt += $", {profile.Grade}";
+            if (!string.IsNullOrEmpty(profile.Teacher)) prompt += $", Teacher: {profile.Teacher}";
+            prompt += "\n";
+        }
+        if (profile.Likes.Count > 0) prompt += $"Likes: {string.Join(", ", profile.Likes)}\n";
+        if (profile.Activities.Count > 0)
+        {
+            var acts = profile.Activities.Select(a => $"{a.Name} ({a.DayOfWeek}s {a.Time})");
+            prompt += $"Activities: {string.Join(", ", acts)}\n";
+        }
+
+        prompt += $"""
+
+            You can help {kid.DisplayName} with:
+            - Their schedule and activities ("What do I have today?")
+            - Homework help (age-appropriate explanations only)
+            - Fun facts and jokes
+            - Reminders and timers
+            - Simple questions and conversations
+            """;
 
         return prompt;
     }

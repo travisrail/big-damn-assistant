@@ -78,6 +78,8 @@ var host = new HostBuilder()
         services.AddSingleton<IAffirmationRepository, CosmosAffirmationRepository>();
         services.AddSingleton<IFeatureRequestRepository, CosmosFeatureRequestRepository>();
         services.AddSingleton<IMemberPreferencesRepository, CosmosMemberPreferencesRepository>();
+        services.AddSingleton<IFamilyProfileRepository, CosmosFamilyProfileRepository>();
+        services.AddSingleton<IKidSmsRepository, CosmosKidSmsRepository>();
 
         // Services
         services.AddSingleton<IClaudeService, ClaudeService>();

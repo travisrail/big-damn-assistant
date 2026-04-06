@@ -9,4 +9,11 @@ public interface IClaudeService
         ConversationHistory history,
         string userMessage,
         CancellationToken cancellationToken = default);
+
+    Task<string> GetKidResponseAsync(
+        KidSmsUser kid,
+        FamilyProfile profile,
+        ConversationHistory history,
+        string userMessage,
+        CancellationToken cancellationToken = default);
 }

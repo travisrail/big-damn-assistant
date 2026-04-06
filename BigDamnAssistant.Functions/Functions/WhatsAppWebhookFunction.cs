@@ -1,5 +1,6 @@
 using System.Net;
 using System.Web;
+using BigDamnAssistant.Core.Models;
 using BigDamnAssistant.Core.Orchestration;
 using BigDamnAssistant.Core.Services;
 using Microsoft.Azure.Functions.Worker;
@@ -58,10 +59,16 @@ public class WhatsAppWebhookFunction
                 return okResponse;
             }
 
+            // Detect channel from Twilio To field
+            var to = formData["To"] ?? string.Empty;
+            var channel = to.StartsWith("whatsapp:", StringComparison.OrdinalIgnoreCase)
+                ? MessageChannel.WhatsApp
+                : MessageChannel.SMS;
+
             // Twilio sends "Author" for group messages (the actual sender's number).
             // When Author is present, "From" is the group identifier.
             var author = formData["Author"];
-            var isGroupChat = !string.IsNullOrEmpty(author);
+            var isGroupChat = channel == MessageChannel.WhatsApp && !string.IsNullOrEmpty(author);
             var from = isGroupChat
                 ? author!.Replace("whatsapp:", "")
                 : formData["From"]?.Replace("whatsapp:", "") ?? string.Empty;
@@ -84,8 +91,8 @@ public class WhatsAppWebhookFunction
                 return okResponse;
             }
 
-            await _orchestrator.HandleInboundWhatsAppAsync(
-                from, messageBody, isGroupChat, mediaUrl, mediaContentType, cancellationToken);
+            await _orchestrator.HandleInboundMessageAsync(
+                from, messageBody, channel, isGroupChat, mediaUrl, mediaContentType, cancellationToken);
         }
         catch (Exception ex)
         {

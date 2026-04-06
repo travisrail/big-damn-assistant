@@ -21,12 +21,15 @@ public class ClaudeServiceTests
         var familyMemoryRepo = Substitute.For<IFamilyMemoryRepository>();
         var emailMonitoringRepo = Substitute.For<IEmailMonitoringRepository>();
         var memberPreferencesRepo = Substitute.For<IMemberPreferencesRepository>();
+        var familyProfileRepo = Substitute.For<IFamilyProfileRepository>();
+        var kidSmsRepo = Substitute.For<IKidSmsRepository>();
         var funContentService = Substitute.For<IFunContentService>();
         var affirmationRepo = Substitute.For<IAffirmationRepository>();
         var featureRequestRepo = Substitute.For<IFeatureRequestRepository>();
         var logger = Substitute.For<ILogger<ClaudeService>>();
         return new ClaudeService(httpFactory, calendarService, mailService, whatsAppService,
             familyMemberRepo, familyMemoryRepo, emailMonitoringRepo, memberPreferencesRepo,
+            familyProfileRepo, kidSmsRepo,
             funContentService, affirmationRepo, featureRequestRepo, logger, options);
     }
 
@@ -235,5 +238,82 @@ public class ClaudeServiceTests
 
         Assert.Single(messages);
         Assert.Equal("user", messages[0].Role);
+    }
+
+    [Fact]
+    public void BuildSystemPrompt_IncludesProfiles_WhenPresent()
+    {
+        var service = CreateService();
+        var member = new FamilyMember { Name = "Travis", Timezone = "America/Chicago" };
+        var now = new DateTimeOffset(2026, 4, 4, 9, 0, 0, TimeSpan.FromHours(-5));
+        var profiles = new List<FamilyProfile>
+        {
+            new()
+            {
+                Name = "Teddy",
+                Age = 8,
+                School = "Manhattan Elementary",
+                Grade = "3rd",
+                Teacher = "Mrs. Anderson",
+                Allergies = new List<string> { "peanuts" },
+                Likes = new List<string> { "Minecraft", "soccer" },
+                Activities = new List<FamilyActivity>
+                {
+                    new() { Name = "Soccer", DayOfWeek = "Tuesday", Time = "4pm", Location = "City Park" }
+                }
+            }
+        };
+
+        var prompt = service.BuildSystemPrompt(member, now, profiles: profiles);
+
+        Assert.Contains("Family Profiles", prompt);
+        Assert.Contains("Teddy (age 8)", prompt);
+        Assert.Contains("Manhattan Elementary", prompt);
+        Assert.Contains("Mrs. Anderson", prompt);
+        Assert.Contains("peanuts", prompt);
+        Assert.Contains("Minecraft", prompt);
+        Assert.Contains("Soccer", prompt);
+    }
+
+    [Fact]
+    public void BuildSystemPrompt_OmitsProfiles_WhenEmpty()
+    {
+        var service = CreateService();
+        var member = new FamilyMember { Name = "Travis", Timezone = "America/Chicago" };
+        var now = new DateTimeOffset(2026, 4, 4, 9, 0, 0, TimeSpan.FromHours(-5));
+
+        var prompt = service.BuildSystemPrompt(member, now, profiles: new List<FamilyProfile>());
+
+        Assert.DoesNotContain("Family Profiles", prompt);
+    }
+
+    [Fact]
+    public void BuildSystemPrompt_IncludesProfileToolInstructions()
+    {
+        var service = CreateService();
+        var member = new FamilyMember { Name = "Travis", Timezone = "America/Chicago" };
+        var now = new DateTimeOffset(2026, 4, 4, 9, 0, 0, TimeSpan.FromHours(-5));
+
+        var prompt = service.BuildSystemPrompt(member, now);
+
+        Assert.Contains("create_family_profile", prompt);
+        Assert.Contains("send_kid_alert", prompt);
+    }
+
+    [Fact]
+    public void BuildKidSystemPrompt_IncludesKidNameAndAge()
+    {
+        var service = CreateService();
+        var kid = new KidSmsUser { DisplayName = "Teddy" };
+        var profile = new FamilyProfile { Name = "Teddy", Age = 8, School = "Manhattan Elementary" };
+        var now = new DateTimeOffset(2026, 4, 4, 9, 0, 0, TimeSpan.FromHours(-5));
+
+        var prompt = service.BuildKidSystemPrompt(kid, profile, now);
+
+        Assert.Contains("Teddy", prompt);
+        Assert.Contains("8 years old", prompt);
+        Assert.Contains("Manhattan Elementary", prompt);
+        Assert.Contains("3 sentences maximum", prompt);
+        Assert.Contains("age-appropriate", prompt);
     }
 }

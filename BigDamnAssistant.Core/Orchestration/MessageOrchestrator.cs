@@ -30,6 +30,8 @@ public class MessageOrchestrator
     private readonly IReminderService _reminderService;
     private readonly IEmailMonitoringRepository _emailMonitoringRepository;
     private readonly IMemberPreferencesRepository _memberPreferencesRepository;
+    private readonly IFamilyProfileRepository _familyProfileRepository;
+    private readonly IKidSmsRepository _kidSmsRepository;
     private readonly ISessionCompressionService _sessionCompressionService;
     private readonly IPreferenceDetectionService _preferenceDetectionService;
     private readonly ILogger<MessageOrchestrator> _logger;
@@ -45,6 +47,8 @@ public class MessageOrchestrator
         IReminderService reminderService,
         IEmailMonitoringRepository emailMonitoringRepository,
         IMemberPreferencesRepository memberPreferencesRepository,
+        IFamilyProfileRepository familyProfileRepository,
+        IKidSmsRepository kidSmsRepository,
         ISessionCompressionService sessionCompressionService,
         IPreferenceDetectionService preferenceDetectionService,
         ILogger<MessageOrchestrator> logger,
@@ -59,27 +63,65 @@ public class MessageOrchestrator
         _reminderService = reminderService;
         _emailMonitoringRepository = emailMonitoringRepository;
         _memberPreferencesRepository = memberPreferencesRepository;
+        _familyProfileRepository = familyProfileRepository;
+        _kidSmsRepository = kidSmsRepository;
         _sessionCompressionService = sessionCompressionService;
         _preferenceDetectionService = preferenceDetectionService;
         _logger = logger;
         _assistantOptions = assistantOptions.Value;
     }
 
-    public async Task HandleInboundWhatsAppAsync(
+    public async Task HandleInboundMessageAsync(
         string fromPhoneNumber,
         string messageBody,
+        MessageChannel channel,
         bool isGroupChat,
         string? mediaUrl = null,
         string? mediaContentType = null,
         CancellationToken cancellationToken = default)
     {
+        // Try adult lookup first
         var member = await _familyMemberRepository.GetByPhoneNumberAsync(fromPhoneNumber, cancellationToken);
-        if (member is null)
+        if (member != null)
         {
-            _logger.LogWarning("Received message from unknown number");
+            await HandleAdultMessageAsync(member, fromPhoneNumber, messageBody, channel, isGroupChat, mediaUrl, mediaContentType, cancellationToken);
             return;
         }
 
+        // Try kid lookup
+        var kid = await _kidSmsRepository.GetByPhoneNumberAsync(fromPhoneNumber, cancellationToken);
+        if (kid != null)
+        {
+            var profile = await _familyProfileRepository.GetByNameAsync(kid.LinkedProfileName, cancellationToken);
+            if (profile == null)
+            {
+                _logger.LogWarning("Kid {KidName} has no linked profile", kid.DisplayName);
+                await _whatsAppService.SendOnChannelAsync(fromPhoneNumber, channel,
+                    "Hmm, I can't find your profile. Ask a parent to set it up!", cancellationToken);
+                return;
+            }
+
+            await HandleKidMessageAsync(kid, profile, fromPhoneNumber, messageBody, channel, cancellationToken);
+            return;
+        }
+
+        // Unknown number
+        _logger.LogWarning("Received message from unknown number on {Channel}", channel);
+        await _whatsAppService.SendOnChannelAsync(fromPhoneNumber, channel,
+            "Hi! I don't recognize this number. Ask a parent to add you to Big Damn Assistant.",
+            cancellationToken);
+    }
+
+    private async Task HandleAdultMessageAsync(
+        FamilyMember member,
+        string fromPhoneNumber,
+        string messageBody,
+        MessageChannel channel,
+        bool isGroupChat,
+        string? mediaUrl,
+        string? mediaContentType,
+        CancellationToken cancellationToken)
+    {
         if (isGroupChat && !messageBody.Contains(_assistantOptions.TriggerKeyword, StringComparison.OrdinalIgnoreCase))
         {
             _logger.LogDebug("Group message ignored — no trigger keyword");
@@ -108,7 +150,6 @@ public class MessageOrchestrator
                 _logger.LogInformation("Pending action expired, clearing");
                 conversation.PendingAction = null;
                 await _conversationRepository.UpsertAsync(conversation, cancellationToken);
-                // Fall through to normal processing
             }
             else if (conversation.PendingAction.ActionType == "BirthdayInviteConfirmation")
             {
@@ -131,7 +172,7 @@ public class MessageOrchestrator
             return;
         }
 
-        _logger.LogInformation("Processing message from {MemberName} (group={IsGroup})", member.Name, isGroupChat);
+        _logger.LogInformation("Processing message from {MemberName} (channel={Channel}, group={IsGroup})", member.Name, channel, isGroupChat);
 
         string response;
         try
@@ -152,7 +193,6 @@ public class MessageOrchestrator
         try
         {
             await _conversationRepository.UpsertAsync(conversation, cancellationToken);
-            _logger.LogInformation("Conversation saved for {Phone}", fromPhoneNumber);
         }
         catch (Exception ex)
         {
@@ -161,16 +201,69 @@ public class MessageOrchestrator
 
         try
         {
-            await _whatsAppService.SendMessageAsync(fromPhoneNumber, response, cancellationToken);
-            _logger.LogInformation("WhatsApp reply sent to {Phone}", fromPhoneNumber);
+            await _whatsAppService.SendOnChannelAsync(fromPhoneNumber, channel, response, cancellationToken);
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Failed to send WhatsApp message to {Phone}: {Message}", fromPhoneNumber, ex.Message);
+            _logger.LogError(ex, "Failed to send message to {Phone}: {Message}", fromPhoneNumber, ex.Message);
         }
 
         // Fire preference detection without blocking the response
         _ = DetectAndSavePreferenceAsync(member, messageBody, response, cancellationToken);
+    }
+
+    private async Task HandleKidMessageAsync(
+        KidSmsUser kid,
+        FamilyProfile profile,
+        string fromPhoneNumber,
+        string messageBody,
+        MessageChannel channel,
+        CancellationToken cancellationToken)
+    {
+        if (string.IsNullOrEmpty(messageBody))
+        {
+            await _whatsAppService.SendOnChannelAsync(fromPhoneNumber, channel,
+                "I didn't get that. Try sending a message!", cancellationToken);
+            return;
+        }
+
+        _logger.LogInformation("Processing kid message from {KidName} on {Channel}", kid.DisplayName, channel);
+
+        var conversation = await _conversationRepository.GetOrCreateAsync(fromPhoneNumber, cancellationToken);
+        await TryCompressSessionAsync(conversation, kid.DisplayName, cancellationToken);
+
+        string response;
+        try
+        {
+            response = await _claudeService.GetKidResponseAsync(kid, profile, conversation, messageBody, cancellationToken);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Claude API failed for kid {KidName}", kid.DisplayName);
+            response = "Oops, I got confused. Try again in a sec!";
+        }
+
+        var maxMessages = _assistantOptions.MaxCurrentSessionMessages;
+        conversation.AddMessage("user", messageBody, maxMessages);
+        conversation.AddMessage("assistant", response, maxMessages);
+
+        try
+        {
+            await _conversationRepository.UpsertAsync(conversation, cancellationToken);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to save kid conversation for {Phone}", fromPhoneNumber);
+        }
+
+        try
+        {
+            await _whatsAppService.SendOnChannelAsync(fromPhoneNumber, channel, response, cancellationToken);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to send message to kid {KidName}: {Message}", kid.DisplayName, ex.Message);
+        }
     }
 
     private async Task HandleMediaMessage(
