@@ -28,8 +28,9 @@ public class ClaudeService : IClaudeService
     private readonly ILogger<ClaudeService> _logger;
     private readonly AssistantOptions _assistantOptions;
 
-    // Track the requesting member for memory attribution
+    // Track the requesting member and conversation for tool handlers
     private FamilyMember? _currentMember;
+    private ConversationHistory? _currentConversation;
 
     public ClaudeService(
         IHttpClientFactory httpClientFactory,
@@ -66,6 +67,7 @@ public class ClaudeService : IClaudeService
         CancellationToken cancellationToken = default)
     {
         _currentMember = member;
+        _currentConversation = history;
         var client = _httpClientFactory.CreateClient("Claude");
         var now = TimeZoneInfo.ConvertTimeBySystemTimeZoneId(DateTimeOffset.UtcNow, member.Timezone);
 
@@ -158,6 +160,7 @@ public class ClaudeService : IClaudeService
                 "add_feature_request" => await HandleAddFeatureRequest(input, cancellationToken),
                 "remove_feature_request" => await HandleRemoveFeatureRequest(input, cancellationToken),
                 "list_feature_requests" => await HandleListFeatureRequests(cancellationToken),
+                "clear_conversation" => HandleClearConversation(),
                 _ => $"Unknown tool: {toolName}"
             };
 
@@ -206,8 +209,8 @@ public class ClaudeService : IClaudeService
             {
                 id = e.Id,
                 subject = e.Subject,
-                start = localStart.ToString("yyyy-MM-dd h:mm tt"),
-                end = localEnd.ToString("yyyy-MM-dd h:mm tt"),
+                start = localStart.ToString("dddd, yyyy-MM-dd h:mm tt"),
+                end = localEnd.ToString("dddd, yyyy-MM-dd h:mm tt"),
                 location = e.Location ?? "No location",
                 attendees = e.Attendees
             };
@@ -691,6 +694,22 @@ public class ClaudeService : IClaudeService
 
     #endregion
 
+    #region Conversation Tools
+
+    private string HandleClearConversation()
+    {
+        if (_currentConversation != null)
+        {
+            _currentConversation.Messages.Clear();
+            _currentConversation.PendingAction = null;
+            _logger.LogInformation("Conversation history cleared for {Phone}", _currentConversation.PhoneNumber);
+        }
+
+        return "Conversation history cleared.";
+    }
+
+    #endregion
+
     private static List<object> BuildToolDefinitions()
     {
         return new List<object>
@@ -998,6 +1017,17 @@ public class ClaudeService : IClaudeService
             },
             new
             {
+                name = "clear_conversation",
+                description = "Clear the current conversation history. Use this when the user asks to clear their chat, start fresh, reset the conversation, or forget what was discussed. This only clears the chat history — family memories are not affected.",
+                input_schema = new
+                {
+                    type = "object",
+                    properties = new Dictionary<string, object>(),
+                    required = Array.Empty<string>()
+                }
+            },
+            new
+            {
                 type = "web_search_20250305",
                 name = "web_search",
                 max_uses = 3
@@ -1034,6 +1064,7 @@ public class ClaudeService : IClaudeService
             Do not use web search for questions answerable from family memory, conversation history, general knowledge, math, or stable facts.
             When answering with search results, summarize in plain conversational language for WhatsApp. Maximum 5 sentences. No URLs, no source citations, no markdown formatting. Do not mention that you searched unless asked.
             Family members can add affirmations to a shared pool used in morning briefings. Use the affirmation tools when asked to add, remove, or list affirmations.
+            When a family member asks to clear their chat, start fresh, reset the conversation, or forget what was discussed, use the clear_conversation tool. Reassure them that family memories are not affected.
             Be warm, concise, and practical. You are not a chatbot — you are a capable assistant.
             """;
 

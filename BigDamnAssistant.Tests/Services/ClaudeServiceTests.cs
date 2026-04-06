@@ -113,6 +113,18 @@ public class ClaudeServiceTests
     }
 
     [Fact]
+    public void BuildSystemPrompt_IncludesClearConversationInstruction()
+    {
+        var service = CreateService();
+        var member = new FamilyMember { Name = "Travis", Timezone = "America/Chicago" };
+        var now = new DateTimeOffset(2026, 4, 4, 9, 0, 0, TimeSpan.FromHours(-5));
+
+        var prompt = service.BuildSystemPrompt(member, now);
+
+        Assert.Contains("clear_conversation", prompt);
+    }
+
+    [Fact]
     public void BuildMessages_AppendsUserMessage()
     {
         var history = new ConversationHistory();
