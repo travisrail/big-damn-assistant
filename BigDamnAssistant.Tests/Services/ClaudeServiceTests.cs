@@ -20,11 +20,14 @@ public class ClaudeServiceTests
         var familyMemberRepo = Substitute.For<IFamilyMemberRepository>();
         var familyMemoryRepo = Substitute.For<IFamilyMemoryRepository>();
         var emailMonitoringRepo = Substitute.For<IEmailMonitoringRepository>();
+        var memberPreferencesRepo = Substitute.For<IMemberPreferencesRepository>();
         var funContentService = Substitute.For<IFunContentService>();
         var affirmationRepo = Substitute.For<IAffirmationRepository>();
         var featureRequestRepo = Substitute.For<IFeatureRequestRepository>();
         var logger = Substitute.For<ILogger<ClaudeService>>();
-        return new ClaudeService(httpFactory, calendarService, mailService, whatsAppService, familyMemberRepo, familyMemoryRepo, emailMonitoringRepo, funContentService, affirmationRepo, featureRequestRepo, logger, options);
+        return new ClaudeService(httpFactory, calendarService, mailService, whatsAppService,
+            familyMemberRepo, familyMemoryRepo, emailMonitoringRepo, memberPreferencesRepo,
+            funContentService, affirmationRepo, featureRequestRepo, logger, options);
     }
 
     [Fact]
@@ -125,7 +128,91 @@ public class ClaudeServiceTests
     }
 
     [Fact]
-    public void BuildMessages_AppendsUserMessage()
+    public void BuildSystemPrompt_IncludesPreferences_WhenPresent()
+    {
+        var service = CreateService();
+        var member = new FamilyMember { Name = "Travis", Timezone = "America/Chicago" };
+        var now = new DateTimeOffset(2026, 4, 4, 9, 0, 0, TimeSpan.FromHours(-5));
+        var prefs = new MemberPreferences
+        {
+            CommunicationStyle = "formal",
+            BriefingLength = "short",
+            LearnedPreferences = new Dictionary<string, string>
+            {
+                ["diet"] = "vegetarian",
+                ["units"] = "metric"
+            }
+        };
+
+        var prompt = service.BuildSystemPrompt(member, now, preferences: prefs);
+
+        Assert.Contains("Travis's Preferences", prompt);
+        Assert.Contains("formal", prompt);
+        Assert.Contains("short", prompt);
+        Assert.Contains("vegetarian", prompt);
+        Assert.Contains("metric", prompt);
+    }
+
+    [Fact]
+    public void BuildSystemPrompt_OmitsPreferences_WhenNull()
+    {
+        var service = CreateService();
+        var member = new FamilyMember { Name = "Travis", Timezone = "America/Chicago" };
+        var now = new DateTimeOffset(2026, 4, 4, 9, 0, 0, TimeSpan.FromHours(-5));
+
+        var prompt = service.BuildSystemPrompt(member, now, preferences: null);
+
+        Assert.DoesNotContain("Preferences", prompt);
+    }
+
+    [Fact]
+    public void BuildSystemPrompt_IncludesSessionSummaries_WhenPresent()
+    {
+        var service = CreateService();
+        var member = new FamilyMember { Name = "Travis", Timezone = "America/Chicago" };
+        var now = new DateTimeOffset(2026, 4, 4, 9, 0, 0, TimeSpan.FromHours(-5));
+        var summaries = new List<SessionSummary>
+        {
+            new() { Summary = "Discussed weekend plans.", SessionDate = new DateTime(2026, 4, 3), MessageCount = 8 },
+            new() { Summary = "Checked calendar events.", SessionDate = new DateTime(2026, 4, 2), MessageCount = 4 }
+        };
+
+        var prompt = service.BuildSystemPrompt(member, now, sessionSummaries: summaries);
+
+        Assert.Contains("Conversation History Summary", prompt);
+        Assert.Contains("Discussed weekend plans.", prompt);
+        Assert.Contains("Checked calendar events.", prompt);
+        Assert.Contains("8 messages", prompt);
+    }
+
+    [Fact]
+    public void BuildSystemPrompt_OmitsSessionSummaries_WhenEmpty()
+    {
+        var service = CreateService();
+        var member = new FamilyMember { Name = "Travis", Timezone = "America/Chicago" };
+        var now = new DateTimeOffset(2026, 4, 4, 9, 0, 0, TimeSpan.FromHours(-5));
+
+        var prompt = service.BuildSystemPrompt(member, now, sessionSummaries: new List<SessionSummary>());
+
+        Assert.DoesNotContain("Conversation History Summary", prompt);
+    }
+
+    [Fact]
+    public void BuildSystemPrompt_IncludesPreferenceToolInstruction()
+    {
+        var service = CreateService();
+        var member = new FamilyMember { Name = "Travis", Timezone = "America/Chicago" };
+        var now = new DateTimeOffset(2026, 4, 4, 9, 0, 0, TimeSpan.FromHours(-5));
+
+        var prompt = service.BuildSystemPrompt(member, now);
+
+        Assert.Contains("set_preference", prompt);
+        Assert.Contains("list_preferences", prompt);
+        Assert.Contains("remove_preference", prompt);
+    }
+
+    [Fact]
+    public void BuildMessages_UsesCurrentSessionMessages()
     {
         var history = new ConversationHistory();
         history.AddMessage("user", "Hi");

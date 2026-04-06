@@ -77,6 +77,7 @@ var host = new HostBuilder()
         services.AddSingleton<IEmailMonitoringRepository, CosmosEmailMonitoringRepository>();
         services.AddSingleton<IAffirmationRepository, CosmosAffirmationRepository>();
         services.AddSingleton<IFeatureRequestRepository, CosmosFeatureRequestRepository>();
+        services.AddSingleton<IMemberPreferencesRepository, CosmosMemberPreferencesRepository>();
 
         // Services
         services.AddSingleton<IClaudeService, ClaudeService>();
@@ -96,6 +97,8 @@ var host = new HostBuilder()
         services.AddSingleton<IFunContentService, FunContentService>();
         services.AddSingleton<IAffirmationService, AffirmationService>();
         services.AddSingleton<IEmailMonitoringService, EmailMonitoringService>();
+        services.AddSingleton<ISessionCompressionService, SessionCompressionService>();
+        services.AddSingleton<IPreferenceDetectionService, PreferenceDetectionService>();
         services.AddSingleton<ICalendarService>(sp =>
         {
             var graphClient = sp.GetRequiredService<GraphServiceClient>();

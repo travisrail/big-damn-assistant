@@ -29,6 +29,9 @@ public class MessageOrchestrator
     private readonly ICalendarService _calendarService;
     private readonly IReminderService _reminderService;
     private readonly IEmailMonitoringRepository _emailMonitoringRepository;
+    private readonly IMemberPreferencesRepository _memberPreferencesRepository;
+    private readonly ISessionCompressionService _sessionCompressionService;
+    private readonly IPreferenceDetectionService _preferenceDetectionService;
     private readonly ILogger<MessageOrchestrator> _logger;
     private readonly AssistantOptions _assistantOptions;
 
@@ -41,6 +44,9 @@ public class MessageOrchestrator
         ICalendarService calendarService,
         IReminderService reminderService,
         IEmailMonitoringRepository emailMonitoringRepository,
+        IMemberPreferencesRepository memberPreferencesRepository,
+        ISessionCompressionService sessionCompressionService,
+        IPreferenceDetectionService preferenceDetectionService,
         ILogger<MessageOrchestrator> logger,
         IOptions<AssistantOptions> assistantOptions)
     {
@@ -52,6 +58,9 @@ public class MessageOrchestrator
         _calendarService = calendarService;
         _reminderService = reminderService;
         _emailMonitoringRepository = emailMonitoringRepository;
+        _memberPreferencesRepository = memberPreferencesRepository;
+        _sessionCompressionService = sessionCompressionService;
+        _preferenceDetectionService = preferenceDetectionService;
         _logger = logger;
         _assistantOptions = assistantOptions.Value;
     }
@@ -77,13 +86,10 @@ public class MessageOrchestrator
             return;
         }
 
-        var conversation = await _conversationRepository.GetByPhoneNumberAsync(fromPhoneNumber, cancellationToken)
-            ?? new ConversationHistory
-            {
-                Id = $"conv-{fromPhoneNumber}",
-                PartitionKey = $"conv-{fromPhoneNumber}",
-                PhoneNumber = fromPhoneNumber
-            };
+        var conversation = await _conversationRepository.GetOrCreateAsync(fromPhoneNumber, cancellationToken);
+
+        // Detect session boundary and compress previous session
+        await TryCompressSessionAsync(conversation, member.Name, cancellationToken);
 
         // Check for pending email action (number selection or yes/no)
         var trimmedMessage = messageBody.Trim();
@@ -139,8 +145,9 @@ public class MessageOrchestrator
             response = "I'm having trouble thinking right now. Give me a moment and try again.";
         }
 
-        conversation.AddMessage("user", messageBody);
-        conversation.AddMessage("assistant", response);
+        var maxMessages = _assistantOptions.MaxCurrentSessionMessages;
+        conversation.AddMessage("user", messageBody, maxMessages);
+        conversation.AddMessage("assistant", response, maxMessages);
 
         try
         {
@@ -161,6 +168,9 @@ public class MessageOrchestrator
         {
             _logger.LogError(ex, "Failed to send WhatsApp message to {Phone}: {Message}", fromPhoneNumber, ex.Message);
         }
+
+        // Fire preference detection without blocking the response
+        _ = DetectAndSavePreferenceAsync(member, messageBody, response, cancellationToken);
     }
 
     private async Task HandleMediaMessage(
@@ -458,8 +468,9 @@ public class MessageOrchestrator
         string response,
         CancellationToken cancellationToken)
     {
-        conversation.AddMessage("user", userMessage);
-        conversation.AddMessage("assistant", response);
+        var maxMessages = _assistantOptions.MaxCurrentSessionMessages;
+        conversation.AddMessage("user", userMessage, maxMessages);
+        conversation.AddMessage("assistant", response, maxMessages);
 
         try
         {
@@ -627,5 +638,112 @@ public class MessageOrchestrator
     {
         _logger.LogInformation("Processing inbound email {MessageId}", messageId);
         await Task.CompletedTask;
+    }
+
+    private async Task TryCompressSessionAsync(ConversationHistory conversation, string memberName, CancellationToken cancellationToken)
+    {
+        if (conversation.CurrentSessionMessages.Count == 0)
+            return;
+
+        var gap = DateTime.UtcNow - conversation.LastMessageAt;
+        if (gap.TotalHours < _assistantOptions.SessionBoundaryHours)
+            return;
+
+        _logger.LogInformation("Session boundary detected ({GapHours:F1}h gap), compressing {Count} messages",
+            gap.TotalHours, conversation.CurrentSessionMessages.Count);
+
+        try
+        {
+            var summary = await _sessionCompressionService.CompressSessionAsync(
+                conversation.CurrentSessionMessages, memberName, cancellationToken);
+
+            conversation.SessionSummaries.Insert(0, new SessionSummary
+            {
+                Summary = summary,
+                SessionDate = conversation.LastMessageAt,
+                MessageCount = conversation.CurrentSessionMessages.Count
+            });
+
+            var maxSummaries = _assistantOptions.MaxSessionSummaries;
+            if (conversation.SessionSummaries.Count > maxSummaries)
+            {
+                conversation.SessionSummaries = conversation.SessionSummaries
+                    .Take(maxSummaries).ToList();
+            }
+
+            conversation.CurrentSessionMessages.Clear();
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Session compression failed, continuing with uncompressed history");
+        }
+    }
+
+    private async Task DetectAndSavePreferenceAsync(FamilyMember member, string userMessage, string assistantResponse, CancellationToken cancellationToken)
+    {
+        try
+        {
+            var result = await _preferenceDetectionService.DetectPreferenceAsync(userMessage, assistantResponse, cancellationToken);
+            if (result == null || !result.PreferenceDetected)
+                return;
+
+            var prefs = await _memberPreferencesRepository.GetAsync(member.PhoneNumber, cancellationToken)
+                ?? new MemberPreferences
+                {
+                    Id = $"prefs-{member.PhoneNumber}",
+                    PhoneNumber = member.PhoneNumber,
+                    MemberName = member.Name
+                };
+
+            var updated = false;
+
+            if (!string.IsNullOrEmpty(result.Field) && !string.IsNullOrEmpty(result.Value))
+            {
+                switch (result.Field.ToLowerInvariant())
+                {
+                    case "briefinglength":
+                        prefs.BriefingLength = result.Value;
+                        updated = true;
+                        break;
+                    case "communicationstyle":
+                        prefs.CommunicationStyle = result.Value;
+                        updated = true;
+                        break;
+                    case "quiethoursstart":
+                        prefs.QuietHoursStart = result.Value;
+                        updated = true;
+                        break;
+                    case "quiethoursend":
+                        prefs.QuietHoursEnd = result.Value;
+                        updated = true;
+                        break;
+                    case "defaultreminderleadtimehours":
+                        if (int.TryParse(result.Value, out var hours))
+                        {
+                            prefs.DefaultReminderLeadTimeHours = hours;
+                            updated = true;
+                        }
+                        break;
+                }
+            }
+
+            if (!string.IsNullOrEmpty(result.LearnedKey) && !string.IsNullOrEmpty(result.LearnedValue))
+            {
+                prefs.LearnedPreferences[result.LearnedKey] = result.LearnedValue;
+                updated = true;
+            }
+
+            if (updated)
+            {
+                prefs.UpdatedAt = DateTime.UtcNow;
+                await _memberPreferencesRepository.UpsertAsync(prefs, cancellationToken);
+                _logger.LogInformation("Auto-detected preference for {MemberName}: {Field}/{Key}",
+                    member.Name, result.Field ?? result.LearnedKey, result.Value ?? result.LearnedValue);
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Preference detection failed for {MemberName}, continuing", member.Name);
+        }
     }
 }

@@ -17,7 +17,7 @@ public class CosmosConversationRepository : IConversationRepository
         _logger = logger;
     }
 
-    public async Task<ConversationHistory?> GetByPhoneNumberAsync(string phoneNumber, CancellationToken cancellationToken = default)
+    public async Task<ConversationHistory> GetOrCreateAsync(string phoneNumber, CancellationToken cancellationToken = default)
     {
         var id = $"conv-{phoneNumber}";
         var partitionKey = new PartitionKey($"conv-{phoneNumber}");
@@ -25,11 +25,21 @@ public class CosmosConversationRepository : IConversationRepository
         try
         {
             var response = await _container.ReadItemAsync<ConversationHistory>(id, partitionKey, cancellationToken: cancellationToken);
-            return response.Resource;
+            var conversation = response.Resource;
+
+            // Migrate legacy documents that use flat Messages array
+            conversation.MigrateIfNeeded();
+
+            return conversation;
         }
         catch (CosmosException ex) when (ex.StatusCode == HttpStatusCode.NotFound)
         {
-            return null;
+            return new ConversationHistory
+            {
+                Id = id,
+                PartitionKey = $"conv-{phoneNumber}",
+                PhoneNumber = phoneNumber
+            };
         }
         catch (CosmosException ex)
         {

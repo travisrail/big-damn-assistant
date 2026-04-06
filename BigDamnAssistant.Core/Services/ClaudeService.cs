@@ -22,6 +22,7 @@ public class ClaudeService : IClaudeService
     private readonly IFamilyMemberRepository _familyMemberRepository;
     private readonly IFamilyMemoryRepository _familyMemoryRepository;
     private readonly IEmailMonitoringRepository _emailMonitoringRepository;
+    private readonly IMemberPreferencesRepository _memberPreferencesRepository;
     private readonly IFunContentService _funContentService;
     private readonly IAffirmationRepository _affirmationRepository;
     private readonly IFeatureRequestRepository _featureRequestRepository;
@@ -40,6 +41,7 @@ public class ClaudeService : IClaudeService
         IFamilyMemberRepository familyMemberRepository,
         IFamilyMemoryRepository familyMemoryRepository,
         IEmailMonitoringRepository emailMonitoringRepository,
+        IMemberPreferencesRepository memberPreferencesRepository,
         IFunContentService funContentService,
         IAffirmationRepository affirmationRepository,
         IFeatureRequestRepository featureRequestRepository,
@@ -53,6 +55,7 @@ public class ClaudeService : IClaudeService
         _familyMemberRepository = familyMemberRepository;
         _familyMemoryRepository = familyMemoryRepository;
         _emailMonitoringRepository = emailMonitoringRepository;
+        _memberPreferencesRepository = memberPreferencesRepository;
         _funContentService = funContentService;
         _affirmationRepository = affirmationRepository;
         _featureRequestRepository = featureRequestRepository;
@@ -71,9 +74,10 @@ public class ClaudeService : IClaudeService
         var client = _httpClientFactory.CreateClient("Claude");
         var now = TimeZoneInfo.ConvertTimeBySystemTimeZoneId(DateTimeOffset.UtcNow, member.Timezone);
 
-        // Load family memories for system prompt injection
+        // Load family memories and member preferences for system prompt injection
         var memories = await _familyMemoryRepository.GetAllAsync(cancellationToken);
-        var systemPrompt = BuildSystemPrompt(member, now, memories);
+        var preferences = await _memberPreferencesRepository.GetAsync(member.PhoneNumber, cancellationToken);
+        var systemPrompt = BuildSystemPrompt(member, now, memories, preferences, history.SessionSummaries);
         var messages = BuildMessages(history, userMessage);
         var tools = BuildToolDefinitions();
 
@@ -161,6 +165,9 @@ public class ClaudeService : IClaudeService
                 "remove_feature_request" => await HandleRemoveFeatureRequest(input, cancellationToken),
                 "list_feature_requests" => await HandleListFeatureRequests(cancellationToken),
                 "clear_conversation" => HandleClearConversation(),
+                "set_preference" => await HandleSetPreference(input, cancellationToken),
+                "list_preferences" => await HandleListPreferences(cancellationToken),
+                "remove_preference" => await HandleRemovePreference(input, cancellationToken),
                 _ => $"Unknown tool: {toolName}"
             };
 
@@ -700,12 +707,164 @@ public class ClaudeService : IClaudeService
     {
         if (_currentConversation != null)
         {
-            _currentConversation.Messages.Clear();
+            _currentConversation.CurrentSessionMessages.Clear();
+            _currentConversation.SessionSummaries.Clear();
             _currentConversation.PendingAction = null;
             _logger.LogInformation("Conversation history cleared for {Phone}", _currentConversation.PhoneNumber);
         }
 
         return "Conversation history cleared.";
+    }
+
+    #endregion
+
+    #region Preference Tools
+
+    private async Task<string> HandleSetPreference(JsonElement? input, CancellationToken cancellationToken)
+    {
+        if (_currentMember == null)
+            return "Error: no current member context.";
+
+        var field = input?.TryGetProperty("field", out var f) == true ? f.GetString() : null;
+        var value = input?.TryGetProperty("value", out var v) == true ? v.GetString() : null;
+        var learnedKey = input?.TryGetProperty("learned_key", out var lk) == true ? lk.GetString() : null;
+        var learnedValue = input?.TryGetProperty("learned_value", out var lv) == true ? lv.GetString() : null;
+
+        if (string.IsNullOrEmpty(field) && string.IsNullOrEmpty(learnedKey))
+            return "Error: either 'field' or 'learned_key' is required.";
+
+        var prefs = await _memberPreferencesRepository.GetAsync(_currentMember.PhoneNumber, cancellationToken)
+            ?? new MemberPreferences
+            {
+                Id = $"prefs-{_currentMember.PhoneNumber}",
+                PhoneNumber = _currentMember.PhoneNumber,
+                MemberName = _currentMember.Name
+            };
+
+        if (!string.IsNullOrEmpty(field) && !string.IsNullOrEmpty(value))
+        {
+            switch (field.ToLowerInvariant())
+            {
+                case "briefinglength":
+                    prefs.BriefingLength = value;
+                    break;
+                case "communicationstyle":
+                    prefs.CommunicationStyle = value;
+                    break;
+                case "quiethoursstart":
+                    prefs.QuietHoursStart = value;
+                    break;
+                case "quiethoursend":
+                    prefs.QuietHoursEnd = value;
+                    break;
+                case "defaultreminderleadtimehours":
+                    if (int.TryParse(value, out var hours))
+                        prefs.DefaultReminderLeadTimeHours = hours;
+                    break;
+                default:
+                    prefs.LearnedPreferences[field] = value;
+                    break;
+            }
+        }
+
+        if (!string.IsNullOrEmpty(learnedKey) && !string.IsNullOrEmpty(learnedValue))
+        {
+            prefs.LearnedPreferences[learnedKey] = learnedValue;
+        }
+
+        prefs.UpdatedAt = DateTime.UtcNow;
+        await _memberPreferencesRepository.UpsertAsync(prefs, cancellationToken);
+
+        _logger.LogInformation("Preference updated for {MemberName}: {Field}/{Key}", _currentMember.Name, field ?? learnedKey, value ?? learnedValue);
+        return "Preference saved successfully.";
+    }
+
+    private async Task<string> HandleListPreferences(CancellationToken cancellationToken)
+    {
+        if (_currentMember == null)
+            return "Error: no current member context.";
+
+        var prefs = await _memberPreferencesRepository.GetAsync(_currentMember.PhoneNumber, cancellationToken);
+        if (prefs == null)
+            return "No preferences have been set yet.";
+
+        return JsonSerializer.Serialize(new
+        {
+            communicationStyle = prefs.CommunicationStyle,
+            briefingLength = prefs.BriefingLength,
+            quietHoursStart = prefs.QuietHoursStart,
+            quietHoursEnd = prefs.QuietHoursEnd,
+            defaultReminderLeadTimeHours = prefs.DefaultReminderLeadTimeHours,
+            topicsOfInterest = prefs.TopicsOfInterest,
+            topicsToAvoid = prefs.TopicsToAvoid,
+            learnedPreferences = prefs.LearnedPreferences
+        });
+    }
+
+    private async Task<string> HandleRemovePreference(JsonElement? input, CancellationToken cancellationToken)
+    {
+        if (_currentMember == null)
+            return "Error: no current member context.";
+
+        var key = input?.TryGetProperty("key", out var k) == true ? k.GetString() : null;
+        if (string.IsNullOrEmpty(key))
+            return "Error: 'key' is required.";
+
+        var prefs = await _memberPreferencesRepository.GetAsync(_currentMember.PhoneNumber, cancellationToken);
+        if (prefs == null)
+            return "No preferences found.";
+
+        var removed = false;
+        var lowerKey = key.ToLowerInvariant();
+
+        // Check structured fields — reset to defaults
+        switch (lowerKey)
+        {
+            case "briefinglength":
+                prefs.BriefingLength = "normal";
+                removed = true;
+                break;
+            case "communicationstyle":
+                prefs.CommunicationStyle = "casual";
+                removed = true;
+                break;
+            case "quiethoursstart":
+                prefs.QuietHoursStart = null;
+                removed = true;
+                break;
+            case "quiethoursend":
+                prefs.QuietHoursEnd = null;
+                removed = true;
+                break;
+            case "defaultreminderleadtimehours":
+                prefs.DefaultReminderLeadTimeHours = 24;
+                removed = true;
+                break;
+        }
+
+        // Check learned preferences
+        if (!removed && prefs.LearnedPreferences.Remove(key))
+        {
+            removed = true;
+        }
+
+        // Try case-insensitive match on learned preferences
+        if (!removed)
+        {
+            var match = prefs.LearnedPreferences.Keys.FirstOrDefault(k => k.Equals(key, StringComparison.OrdinalIgnoreCase));
+            if (match != null)
+            {
+                prefs.LearnedPreferences.Remove(match);
+                removed = true;
+            }
+        }
+
+        if (!removed)
+            return $"No preference found matching '{key}'.";
+
+        prefs.UpdatedAt = DateTime.UtcNow;
+        await _memberPreferencesRepository.UpsertAsync(prefs, cancellationToken);
+        return $"Preference '{key}' removed successfully.";
     }
 
     #endregion
@@ -1028,6 +1187,48 @@ public class ClaudeService : IClaudeService
             },
             new
             {
+                name = "set_preference",
+                description = "Save a personal preference for the current family member. Use for structured preferences (briefing length, communication style, quiet hours, reminder lead time) or free-form learned preferences (diet, interests, units, etc.).",
+                input_schema = new
+                {
+                    type = "object",
+                    properties = new Dictionary<string, object>
+                    {
+                        ["field"] = new { type = "string", description = "Structured field name: briefingLength, communicationStyle, quietHoursStart, quietHoursEnd, defaultReminderLeadTimeHours. Null for free-form." },
+                        ["value"] = new { type = "string", description = "Value for the structured field." },
+                        ["learned_key"] = new { type = "string", description = "Short key for free-form preference (e.g. 'diet', 'units', 'humor style')." },
+                        ["learned_value"] = new { type = "string", description = "Value for the free-form preference (e.g. 'vegetarian', 'metric', 'dad jokes')." }
+                    },
+                    required = Array.Empty<string>()
+                }
+            },
+            new
+            {
+                name = "list_preferences",
+                description = "List all saved preferences for the current family member. Use when they ask to see their preferences or what you know about them.",
+                input_schema = new
+                {
+                    type = "object",
+                    properties = new Dictionary<string, object>(),
+                    required = Array.Empty<string>()
+                }
+            },
+            new
+            {
+                name = "remove_preference",
+                description = "Remove a saved preference for the current family member. Use when they ask to forget a preference.",
+                input_schema = new
+                {
+                    type = "object",
+                    properties = new Dictionary<string, object>
+                    {
+                        ["key"] = new { type = "string", description = "The preference key to remove — either a structured field name or a learned preference key." }
+                    },
+                    required = new[] { "key" }
+                }
+            },
+            new
+            {
                 type = "web_search_20250305",
                 name = "web_search",
                 max_uses = 3
@@ -1035,7 +1236,12 @@ public class ClaudeService : IClaudeService
         };
     }
 
-    public string BuildSystemPrompt(FamilyMember member, DateTimeOffset localNow, IReadOnlyList<FamilyMemory>? memories = null)
+    public string BuildSystemPrompt(
+        FamilyMember member,
+        DateTimeOffset localNow,
+        IReadOnlyList<FamilyMemory>? memories = null,
+        MemberPreferences? preferences = null,
+        IReadOnlyList<SessionSummary>? sessionSummaries = null)
     {
         var prompt = $"""
             You are {_assistantOptions.Name}, a helpful family AI assistant.
@@ -1065,9 +1271,41 @@ public class ClaudeService : IClaudeService
             When answering with search results, summarize in plain conversational language for WhatsApp. Maximum 5 sentences. No URLs, no source citations, no markdown formatting. Do not mention that you searched unless asked.
             Family members can add affirmations to a shared pool used in morning briefings. Use the affirmation tools when asked to add, remove, or list affirmations.
             When a family member asks to clear their chat, start fresh, reset the conversation, or forget what was discussed, use the clear_conversation tool. Reassure them that family memories are not affected.
+            Family members can set, view, and remove personal preferences using the preference tools. When someone says "set my briefing to short", "I prefer detailed responses", "don't message me before 8am", "I'm vegetarian", etc., use set_preference. When they ask to see their preferences, use list_preferences. When they ask to forget a preference, use remove_preference.
             Be warm, concise, and practical. You are not a chatbot — you are a capable assistant.
             """;
 
+        // Member preferences
+        if (preferences != null)
+        {
+            prompt += $"\n\n## {member.Name}'s Preferences\n";
+            prompt += $"Communication style: {preferences.CommunicationStyle}\n";
+            prompt += $"Briefing length: {preferences.BriefingLength}\n";
+
+            if (!string.IsNullOrEmpty(preferences.QuietHoursStart) || !string.IsNullOrEmpty(preferences.QuietHoursEnd))
+            {
+                prompt += $"Quiet hours: {preferences.QuietHoursStart ?? "22:00"} to {preferences.QuietHoursEnd ?? "07:00"}\n";
+            }
+
+            prompt += $"Default reminder lead time: {preferences.DefaultReminderLeadTimeHours} hours\n";
+
+            if (preferences.TopicsOfInterest.Count > 0)
+                prompt += $"Topics of interest: {string.Join(", ", preferences.TopicsOfInterest)}\n";
+
+            if (preferences.TopicsToAvoid.Count > 0)
+                prompt += $"Topics to avoid: {string.Join(", ", preferences.TopicsToAvoid)}\n";
+
+            if (preferences.LearnedPreferences.Count > 0)
+            {
+                prompt += "\nAdditional preferences:\n";
+                foreach (var kvp in preferences.LearnedPreferences)
+                {
+                    prompt += $"- {kvp.Key}: {kvp.Value}\n";
+                }
+            }
+        }
+
+        // Family knowledge base
         if (memories != null && memories.Count > 0)
         {
             prompt += "\n\n## Family Knowledge Base\nThe following facts have been saved by your family. Treat these as ground truth when answering questions:\n\n";
@@ -1077,12 +1315,22 @@ public class ClaudeService : IClaudeService
             }
         }
 
+        // Session summaries
+        if (sessionSummaries != null && sessionSummaries.Count > 0)
+        {
+            prompt += $"\n\n## Conversation History Summary\nThe following are summaries of previous conversations with {member.Name}:\n\n";
+            foreach (var summary in sessionSummaries)
+            {
+                prompt += $"**{summary.SessionDate:MMMM d, yyyy}** ({summary.MessageCount} messages):\n{summary.Summary}\n\n";
+            }
+        }
+
         return prompt;
     }
 
     public static List<ClaudeMessage> BuildMessages(ConversationHistory history, string userMessage)
     {
-        var messages = history.Messages
+        var messages = history.CurrentSessionMessages
             .Select(m => new ClaudeMessage { Role = m.Role, Content = new List<object> { new ContentBlock { Type = "text", Text = m.Content } } })
             .ToList();
 
