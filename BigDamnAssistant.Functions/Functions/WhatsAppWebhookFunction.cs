@@ -59,10 +59,13 @@ public class WhatsAppWebhookFunction
                 return okResponse;
             }
 
-            // Ignore Twilio delivery status callbacks (no Body, has MessageStatus/SmsStatus)
-            if (!string.IsNullOrEmpty(formData["MessageStatus"]) || !string.IsNullOrEmpty(formData["SmsStatus"]))
+            // Ignore Twilio delivery status callbacks (outbound statuses like sent/delivered/failed)
+            // Inbound messages have SmsStatus=received which we must NOT filter out
+            var messageStatus = formData["MessageStatus"] ?? formData["SmsStatus"] ?? "";
+            if (!string.IsNullOrEmpty(messageStatus)
+                && !messageStatus.Equals("received", StringComparison.OrdinalIgnoreCase))
             {
-                _logger.LogDebug("Ignoring Twilio status callback: {Status}", formData["MessageStatus"] ?? formData["SmsStatus"]);
+                _logger.LogDebug("Ignoring Twilio status callback: {Status}", messageStatus);
                 return okResponse;
             }
 
