@@ -8,6 +8,7 @@ public class CalendarEvent
     public DateTimeOffset End { get; set; }
     public string? Location { get; set; }
     public string? Body { get; set; }
+    public bool IsAllDay { get; set; }
     public List<string> Attendees { get; set; } = new();
 }
 

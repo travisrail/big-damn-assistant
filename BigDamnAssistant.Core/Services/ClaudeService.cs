@@ -231,6 +231,7 @@ public class ClaudeService : IClaudeService
             {
                 "get_calendar_events" => await HandleGetCalendarEvents(input, memberTimezone, cancellationToken),
                 "create_calendar_event" => await HandleCreateCalendarEvent(input, cancellationToken),
+                "update_calendar_event" => await HandleUpdateCalendarEvent(input, cancellationToken),
                 "cancel_calendar_event" => await HandleCancelCalendarEvent(input, cancellationToken),
                 "get_family_members" => await HandleGetFamilyMembers(cancellationToken),
                 "save_memory" => await HandleSaveMemory(input, cancellationToken),
@@ -311,8 +312,9 @@ public class ClaudeService : IClaudeService
             {
                 id = e.Id,
                 subject = e.Subject,
-                start = localStart.ToString("dddd, yyyy-MM-dd h:mm tt"),
-                end = localEnd.ToString("dddd, yyyy-MM-dd h:mm tt"),
+                isAllDay = e.IsAllDay,
+                start = e.IsAllDay ? localStart.ToString("dddd, yyyy-MM-dd") : localStart.ToString("dddd, yyyy-MM-dd h:mm tt"),
+                end = e.IsAllDay ? localEnd.ToString("dddd, yyyy-MM-dd") : localEnd.ToString("dddd, yyyy-MM-dd h:mm tt"),
                 location = e.Location ?? "No location",
                 attendees = e.Attendees
             };
@@ -327,6 +329,7 @@ public class ClaudeService : IClaudeService
         var startStr = input?.GetProperty("start").GetString() ?? "";
         var endStr = input?.GetProperty("end").GetString() ?? "";
         var location = input?.TryGetProperty("location", out var loc) == true ? loc.GetString() : null;
+        var isAllDay = input?.TryGetProperty("is_all_day", out var allDay) == true && allDay.GetBoolean();
 
         var attendees = new List<string>();
         if (input?.TryGetProperty("attendees", out var attendeesEl) == true && attendeesEl.ValueKind == JsonValueKind.Array)
@@ -345,6 +348,7 @@ public class ClaudeService : IClaudeService
             Start = DateTimeOffset.Parse(startStr),
             End = DateTimeOffset.Parse(endStr),
             Location = location,
+            IsAllDay = isAllDay,
             Attendees = attendees
         };
 
@@ -356,6 +360,37 @@ public class ClaudeService : IClaudeService
         if (attendees.Count > 0)
             result += $" Invitations sent to: {string.Join(", ", attendees)}";
         return result;
+    }
+
+    private async Task<string> HandleUpdateCalendarEvent(JsonElement? input, CancellationToken cancellationToken)
+    {
+        var eventId = input?.GetProperty("event_id").GetString();
+        if (string.IsNullOrEmpty(eventId))
+            return "Error: 'event_id' is required. Use get_calendar_events first to find the event ID.";
+
+        var location = input?.TryGetProperty("location", out var loc) == true ? loc.GetString() : null;
+        var subject = input?.TryGetProperty("subject", out var subj) == true ? subj.GetString() : null;
+        var startStr = input?.TryGetProperty("start", out var s) == true ? s.GetString() : null;
+        var endStr = input?.TryGetProperty("end", out var e) == true ? e.GetString() : null;
+
+        var calendarEvent = new CalendarEvent { Id = eventId };
+
+        // Only set fields that were provided
+        if (!string.IsNullOrEmpty(subject)) calendarEvent.Subject = subject;
+        if (!string.IsNullOrEmpty(startStr)) calendarEvent.Start = DateTimeOffset.Parse(startStr);
+        if (!string.IsNullOrEmpty(endStr)) calendarEvent.End = DateTimeOffset.Parse(endStr);
+        calendarEvent.Location = location;
+
+        _logger.LogInformation("Updating calendar event {EventId}", eventId);
+        await _calendarService.UpdateEventAsync(calendarEvent, cancellationToken);
+
+        var updates = new List<string>();
+        if (!string.IsNullOrEmpty(location)) updates.Add($"location: {location}");
+        if (!string.IsNullOrEmpty(subject)) updates.Add($"subject: {subject}");
+        if (!string.IsNullOrEmpty(startStr)) updates.Add("start time");
+        if (!string.IsNullOrEmpty(endStr)) updates.Add("end time");
+
+        return $"Event updated successfully ({string.Join(", ", updates)}).";
     }
 
     private async Task<string> HandleCancelCalendarEvent(JsonElement? input, CancellationToken cancellationToken)
@@ -1227,9 +1262,28 @@ public class ClaudeService : IClaudeService
                         ["start"] = new { type = "string", description = "Start date/time in ISO 8601 format" },
                         ["end"] = new { type = "string", description = "End date/time in ISO 8601 format" },
                         ["location"] = new { type = "string", description = "Event location (optional)" },
+                        ["is_all_day"] = new { type = "boolean", description = "Set to true for all-day events. When true, start/end should be date-only ISO format (e.g. 2026-04-10). End date should be the day AFTER the last day of the event." },
                         ["attendees"] = new { type = "array", items = new { type = "string" }, description = "List of attendee email addresses to invite (optional)" }
                     },
                     required = new[] { "subject", "start", "end" }
+                }
+            },
+            new
+            {
+                name = "update_calendar_event",
+                description = "Update an existing calendar event. Use get_calendar_events first to find the event ID. Can update location, subject, start, and end times. Only provide the fields you want to change.",
+                input_schema = new
+                {
+                    type = "object",
+                    properties = new Dictionary<string, object>
+                    {
+                        ["event_id"] = new { type = "string", description = "The ID of the event to update (from get_calendar_events results)" },
+                        ["location"] = new { type = "string", description = "New event location" },
+                        ["subject"] = new { type = "string", description = "New event title/subject" },
+                        ["start"] = new { type = "string", description = "New start date/time in ISO 8601 format" },
+                        ["end"] = new { type = "string", description = "New end date/time in ISO 8601 format" }
+                    },
+                    required = new[] { "event_id" }
                 }
             },
             new
@@ -1807,7 +1861,9 @@ public class ClaudeService : IClaudeService
             When searching for an event, look for partial matches anywhere in the event subject, not just exact title matches.
             When the user wants to invite family members to an event, use get_family_members to look up their email addresses first.
             When the user says "invite all family members" or "invite everyone", look up all family members and add all their emails as attendees.
+            To update an event (change location, time, or title), first use get_calendar_events to find it and get its ID, then use update_calendar_event.
             To cancel an event, first use get_calendar_events to find it and get its ID, then use cancel_calendar_event.
+            When creating an all-day event, set is_all_day to true and use date-only ISO format for start/end (e.g. 2026-04-10). The end date must be the day AFTER the last day — for a single all-day event on April 10, use start=2026-04-10 and end=2026-04-11.
             When asked to send an email, use the send_email tool.
             When a family member asks you to remember, note, or save something, use the save_memory tool.
             When asked to forget or delete a memory, use the delete_memory tool.

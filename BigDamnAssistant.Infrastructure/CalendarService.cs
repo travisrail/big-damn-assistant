@@ -33,7 +33,7 @@ public class CalendarService : ICalendarService
                 {
                     config.QueryParameters.StartDateTime = from.ToString("O");
                     config.QueryParameters.EndDateTime = to.ToString("O");
-                    config.QueryParameters.Select = new[] { "id", "subject", "start", "end", "location", "bodyPreview", "attendees" };
+                    config.QueryParameters.Select = new[] { "id", "subject", "start", "end", "location", "bodyPreview", "attendees", "isAllDay" };
                     config.QueryParameters.Orderby = new[] { "start/dateTime" };
                     config.QueryParameters.Top = 250;
                 }, cancellationToken);
@@ -48,6 +48,7 @@ public class CalendarService : ICalendarService
                     End = ParseGraphDateTime(e.End),
                     Location = e.Location?.DisplayName,
                     Body = e.BodyPreview,
+                    IsAllDay = e.IsAllDay ?? false,
                     Attendees = e.Attendees?.Select(a => a.EmailAddress?.Address ?? "").Where(a => !string.IsNullOrEmpty(a)).ToList() ?? new()
                 }));
 
@@ -76,16 +77,25 @@ public class CalendarService : ICalendarService
     {
         try
         {
-            var startUtc = calendarEvent.Start.UtcDateTime;
-            var endUtc = calendarEvent.End.UtcDateTime;
-
             var graphEvent = new Event
             {
                 Subject = calendarEvent.Subject,
-                Start = new DateTimeTimeZone { DateTime = startUtc.ToString("yyyy-MM-ddTHH:mm:ss"), TimeZone = "UTC" },
-                End = new DateTimeTimeZone { DateTime = endUtc.ToString("yyyy-MM-ddTHH:mm:ss"), TimeZone = "UTC" },
+                IsAllDay = calendarEvent.IsAllDay,
                 Location = calendarEvent.Location is not null ? new Location { DisplayName = calendarEvent.Location } : null
             };
+
+            if (calendarEvent.IsAllDay)
+            {
+                graphEvent.Start = new DateTimeTimeZone { DateTime = calendarEvent.Start.ToString("yyyy-MM-dd"), TimeZone = "UTC" };
+                graphEvent.End = new DateTimeTimeZone { DateTime = calendarEvent.End.ToString("yyyy-MM-dd"), TimeZone = "UTC" };
+            }
+            else
+            {
+                var startUtc = calendarEvent.Start.UtcDateTime;
+                var endUtc = calendarEvent.End.UtcDateTime;
+                graphEvent.Start = new DateTimeTimeZone { DateTime = startUtc.ToString("yyyy-MM-ddTHH:mm:ss"), TimeZone = "UTC" };
+                graphEvent.End = new DateTimeTimeZone { DateTime = endUtc.ToString("yyyy-MM-ddTHH:mm:ss"), TimeZone = "UTC" };
+            }
 
             if (calendarEvent.Attendees.Count > 0)
             {
@@ -112,16 +122,25 @@ public class CalendarService : ICalendarService
     {
         try
         {
-            var startUtc = calendarEvent.Start.UtcDateTime;
-            var endUtc = calendarEvent.End.UtcDateTime;
-
             var graphEvent = new Event
             {
                 Subject = calendarEvent.Subject,
-                Start = new DateTimeTimeZone { DateTime = startUtc.ToString("yyyy-MM-ddTHH:mm:ss"), TimeZone = "UTC" },
-                End = new DateTimeTimeZone { DateTime = endUtc.ToString("yyyy-MM-ddTHH:mm:ss"), TimeZone = "UTC" },
+                IsAllDay = calendarEvent.IsAllDay,
                 Location = calendarEvent.Location is not null ? new Location { DisplayName = calendarEvent.Location } : null
             };
+
+            if (calendarEvent.IsAllDay)
+            {
+                graphEvent.Start = new DateTimeTimeZone { DateTime = calendarEvent.Start.ToString("yyyy-MM-dd"), TimeZone = "UTC" };
+                graphEvent.End = new DateTimeTimeZone { DateTime = calendarEvent.End.ToString("yyyy-MM-dd"), TimeZone = "UTC" };
+            }
+            else
+            {
+                var startUtc = calendarEvent.Start.UtcDateTime;
+                var endUtc = calendarEvent.End.UtcDateTime;
+                graphEvent.Start = new DateTimeTimeZone { DateTime = startUtc.ToString("yyyy-MM-ddTHH:mm:ss"), TimeZone = "UTC" };
+                graphEvent.End = new DateTimeTimeZone { DateTime = endUtc.ToString("yyyy-MM-ddTHH:mm:ss"), TimeZone = "UTC" };
+            }
 
             await _graphClient.Users[_userId].Events[calendarEvent.Id].PatchAsync(graphEvent, cancellationToken: cancellationToken);
             return calendarEvent;
