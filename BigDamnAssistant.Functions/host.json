@@ -1,5 +1,6 @@
 {
   "version": "2.0",
+  "functionTimeout": "00:10:00",
   "logging": {
     "applicationInsights": {
       "samplingSettings": {
@@ -13,6 +14,12 @@
       "Function": "Information",
       "Host.Aggregator": "Trace",
       "BigDamnAssistant": "Debug"
+    }
+  },
+  "extensions": {
+    "queues": {
+      "maxDequeueCount": 5,
+      "visibilityTimeout": "00:00:30"
     }
   }
 }

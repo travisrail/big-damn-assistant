@@ -24,6 +24,7 @@ public class MessageOrchestratorTests
     private readonly IPreferenceDetectionService _preferenceDetectionService = Substitute.For<IPreferenceDetectionService>();
     private readonly IFamilyProfileRepository _familyProfileRepo = Substitute.For<IFamilyProfileRepository>();
     private readonly IKidSmsRepository _kidSmsRepo = Substitute.For<IKidSmsRepository>();
+    private readonly IProcessedMessageRepository _processedMessageRepo = Substitute.For<IProcessedMessageRepository>();
     private readonly ILogger<MessageOrchestrator> _logger = Substitute.For<ILogger<MessageOrchestrator>>();
     private readonly AssistantOptions _options = new() { Name = "Big Damn Assistant", TriggerKeyword = "BDA" };
     private readonly MessageOrchestrator _sut;
@@ -35,6 +36,7 @@ public class MessageOrchestratorTests
             _inviteService, _calendarService, _reminderService, _emailMonitoringRepo,
             _memberPreferencesRepo, _familyProfileRepo, _kidSmsRepo,
             _sessionCompressionService, _preferenceDetectionService,
+            _processedMessageRepo,
             _logger, Options.Create(_options));
     }
 
@@ -521,5 +523,88 @@ public class MessageOrchestratorTests
                 c.CurrentSessionMessages[0].Content == "Hello" &&
                 c.CurrentSessionMessages[1].Content == "Response!"),
                 Arg.Any<CancellationToken>());
+    }
+
+    // ProcessAsync deduplication tests
+
+    [Fact]
+    public async Task ProcessAsync_DuplicateMessageSid_SkipsProcessing()
+    {
+        SetupKnownMember();
+        _processedMessageRepo.ExistsAsync("SM123", Arg.Any<CancellationToken>()).Returns(true);
+
+        var message = new InboundMessage
+        {
+            MessageSid = "SM123",
+            From = "+15551234567",
+            Body = "Hello",
+            Channel = MessageChannel.WhatsApp
+        };
+
+        await _sut.ProcessAsync(message, CancellationToken.None);
+
+        await _claudeService.DidNotReceive()
+            .GetResponseAsync(Arg.Any<FamilyMember>(), Arg.Any<ConversationHistory>(), Arg.Any<string>(), Arg.Any<CancellationToken>());
+    }
+
+    [Fact]
+    public async Task ProcessAsync_NewMessageSid_CreatesDeduplicationDocument()
+    {
+        SetupKnownMember();
+        _processedMessageRepo.ExistsAsync("SM456", Arg.Any<CancellationToken>()).Returns(false);
+
+        var message = new InboundMessage
+        {
+            MessageSid = "SM456",
+            From = "+15551234567",
+            Body = "Hello",
+            Channel = MessageChannel.WhatsApp
+        };
+
+        await _sut.ProcessAsync(message, CancellationToken.None);
+
+        await _processedMessageRepo.Received(1)
+            .CreateAsync(Arg.Is<ProcessedMessage>(p => p.MessageSid == "SM456"), Arg.Any<CancellationToken>());
+    }
+
+    [Fact]
+    public async Task ProcessAsync_NewMessage_ProcessesNormally()
+    {
+        SetupKnownMember();
+        _processedMessageRepo.ExistsAsync("SM789", Arg.Any<CancellationToken>()).Returns(false);
+
+        var message = new InboundMessage
+        {
+            MessageSid = "SM789",
+            From = "+15551234567",
+            Body = "Hello",
+            Channel = MessageChannel.WhatsApp
+        };
+
+        await _sut.ProcessAsync(message, CancellationToken.None);
+
+        await _whatsAppService.Received(1)
+            .SendOnChannelAsync("+15551234567", MessageChannel.WhatsApp, "Response", Arg.Any<CancellationToken>());
+    }
+
+    [Fact]
+    public async Task ProcessAsync_EmptyMessageSid_SkipsDeduplication()
+    {
+        SetupKnownMember();
+
+        var message = new InboundMessage
+        {
+            MessageSid = "",
+            From = "+15551234567",
+            Body = "Hello",
+            Channel = MessageChannel.WhatsApp
+        };
+
+        await _sut.ProcessAsync(message, CancellationToken.None);
+
+        await _processedMessageRepo.DidNotReceive()
+            .ExistsAsync(Arg.Any<string>(), Arg.Any<CancellationToken>());
+        await _whatsAppService.Received(1)
+            .SendOnChannelAsync("+15551234567", MessageChannel.WhatsApp, "Response", Arg.Any<CancellationToken>());
     }
 }

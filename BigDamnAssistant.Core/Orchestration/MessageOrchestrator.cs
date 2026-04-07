@@ -34,6 +34,7 @@ public class MessageOrchestrator
     private readonly IKidSmsRepository _kidSmsRepository;
     private readonly ISessionCompressionService _sessionCompressionService;
     private readonly IPreferenceDetectionService _preferenceDetectionService;
+    private readonly IProcessedMessageRepository _processedMessageRepository;
     private readonly ILogger<MessageOrchestrator> _logger;
     private readonly AssistantOptions _assistantOptions;
 
@@ -51,6 +52,7 @@ public class MessageOrchestrator
         IKidSmsRepository kidSmsRepository,
         ISessionCompressionService sessionCompressionService,
         IPreferenceDetectionService preferenceDetectionService,
+        IProcessedMessageRepository processedMessageRepository,
         ILogger<MessageOrchestrator> logger,
         IOptions<AssistantOptions> assistantOptions)
     {
@@ -67,8 +69,39 @@ public class MessageOrchestrator
         _kidSmsRepository = kidSmsRepository;
         _sessionCompressionService = sessionCompressionService;
         _preferenceDetectionService = preferenceDetectionService;
+        _processedMessageRepository = processedMessageRepository;
         _logger = logger;
         _assistantOptions = assistantOptions.Value;
+    }
+
+    public async Task ProcessAsync(InboundMessage message, CancellationToken cancellationToken = default)
+    {
+        // Deduplication: check if this MessageSid has already been processed
+        if (!string.IsNullOrEmpty(message.MessageSid))
+        {
+            if (await _processedMessageRepository.ExistsAsync(message.MessageSid, cancellationToken))
+            {
+                _logger.LogWarning("Duplicate message detected: {MessageSid}, skipping", message.MessageSid);
+                return;
+            }
+
+            // Mark as processed immediately to prevent concurrent duplicates
+            await _processedMessageRepository.CreateAsync(new ProcessedMessage
+            {
+                Id = $"processed-{message.MessageSid}",
+                MessageSid = message.MessageSid,
+                ProcessedAt = DateTime.UtcNow
+            }, cancellationToken);
+        }
+
+        await HandleInboundMessageAsync(
+            message.From,
+            message.Body,
+            message.Channel,
+            message.IsGroupChat,
+            message.MediaUrl,
+            message.MediaContentType,
+            cancellationToken);
     }
 
     public async Task HandleInboundMessageAsync(

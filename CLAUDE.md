@@ -23,23 +23,43 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Architecture
 
 ```
-WhatsApp (Twilio) ──► HTTP Trigger Function ──► Orchestrator ──► Claude API
-                                                      │
-Graph Webhook ────► HTTP Trigger Function ────────────┤
-                                                      │
-Timer Triggers ──► Scheduled Function ────────────────┤
-                                                      │
-                                              ┌───────▼────────┐
-                                              │  Cosmos DB     │
-                                              │  Key Vault     │
-                                              │  Graph API     │
-                                              │  Twilio SDK    │
-                                              └────────────────┘
+WhatsApp (Twilio) ──► HTTP Trigger ──► Storage Queue ──► Queue Trigger ──► Orchestrator ──► Claude API
+                                                                                │
+Graph Webhook ────► HTTP Trigger ───────────────────────────────────────────────┤
+                                                                                │
+Timer Triggers ──► Scheduled Function ──────────────────────────────────────────┤
+                                                                                │
+                                                                        ┌───────▼────────┐
+                                                                        │  Cosmos DB     │
+                                                                        │  Key Vault     │
+                                                                        │  Graph API     │
+                                                                        │  Twilio SDK    │
+                                                                        └────────────────┘
 ```
+
+### Message Processing Architecture
+
+All inbound messages (WhatsApp and SMS) follow an async two-step pattern:
+
+1. **WhatsAppWebhookFunction** (HTTP Trigger) — validates Twilio signature, parses message, enqueues to Azure Storage Queue (`bda-inbound-messages`), returns HTTP 200 with empty TwiML immediately
+2. **MessageProcessingFunction** (Queue Trigger) — dequeues message, runs `MessageOrchestrator.ProcessAsync`, sends reply via Twilio REST API outbound
+
+This pattern exists to avoid Twilio's 15-second webhook timeout. The queue trigger has a 10-minute timeout (`host.json: functionTimeout`).
+
+**Deduplication:** Azure Storage Queue provides at-least-once delivery. `ProcessAsync` checks Cosmos for a `processed-{MessageSid}` document before processing. Documents have a 24-hour TTL.
+
+**Poison messages:** After 5 failed retries (`host.json: maxDequeueCount`), messages move to `bda-inbound-messages-poison`. The `PoisonMessageFunction` notifies the admin via WhatsApp.
+
+**Rules:**
+- DO NOT add processing logic to WhatsAppWebhookFunction
+- DO NOT return message content in the webhook HTTP response
+- ALL replies must be sent via `IWhatsAppService` outbound methods
+- ALL processing logic belongs in `MessageOrchestrator` via `ProcessAsync`
 
 ### Azure Resources
 - **Azure Functions** — .NET 8 isolated worker, all compute lives here
-- **Cosmos DB** — conversation history, family member profiles, reminder documents, Graph subscription state
+- **Azure Storage Queue** — decouples webhook response from message processing (`bda-inbound-messages`)
+- **Cosmos DB** — conversation history, family member profiles, reminder documents, Graph subscription state, message deduplication
 - **Azure Key Vault** — all secrets (Twilio auth, Anthropic API key, Graph client secret)
 - **Managed Identity** — used by Functions to access Key Vault; never hardcode credentials
 - **Microsoft Graph API** — O365 mailbox (Mail.ReadWrite) and calendar (Calendars.ReadWrite)
@@ -55,6 +75,7 @@ Timer Triggers ──► Scheduled Function ────────────
 | AI | Anthropic Claude API (claude-sonnet-4-20250514) |
 | Messaging | Twilio WhatsApp Business API |
 | Email + Calendar | Microsoft Graph API (`Microsoft.Graph` NuGet) |
+| Queue | Azure Storage Queue (`bda-inbound-messages`) |
 | Database | Azure Cosmos DB (NoSQL, single container) |
 | Secrets | Azure Key Vault via Managed Identity |
 | Auth (Graph) | Entra ID app registration, client credentials flow |
@@ -68,7 +89,9 @@ Timer Triggers ──► Scheduled Function ────────────
 BigDamnAssistant/
 ├── BigDamnAssistant.Functions/        # Azure Functions project
 │   ├── Functions/
-│   │   ├── WhatsAppWebhookFunction.cs
+│   │   ├── WhatsAppWebhookFunction.cs   # Validates + enqueues only
+│   │   ├── MessageProcessingFunction.cs # Queue trigger — all processing
+│   │   ├── PoisonMessageFunction.cs     # Poison queue — admin notification
 │   │   ├── GraphWebhookFunction.cs
 │   │   ├── MorningBriefingFunction.cs
 │   │   ├── WeeklyRecapFunction.cs
@@ -159,6 +182,18 @@ All documents include a `type` discriminator field.
   "subscriptionId": "...",
   "expiresAt": "2026-01-04T00:00:00Z",
   "resource": "me/mailFolders/inbox/messages"
+}
+```
+
+**Processed Message (Deduplication)**
+```json
+{
+  "id": "processed-{MessageSid}",
+  "partitionKey": "processedMessages",
+  "type": "processedMessage",
+  "messageSid": "SMxxxxxxxxxx",
+  "processedAt": "2026-01-01T00:00:00Z",
+  "ttl": 86400
 }
 ```
 

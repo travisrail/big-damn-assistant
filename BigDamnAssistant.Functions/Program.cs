@@ -1,4 +1,5 @@
 using Azure.Identity;
+using Azure.Storage.Queues;
 using BigDamnAssistant.Core.Configuration;
 using BigDamnAssistant.Core.Orchestration;
 using BigDamnAssistant.Core.Repositories;
@@ -58,6 +59,12 @@ var host = new HostBuilder()
         // Twilio
         TwilioClient.Init(config["Twilio:AccountSid"], config["Twilio:AuthToken"]);
 
+        // Azure Storage Queue
+        services.AddSingleton(_ =>
+        {
+            return new QueueServiceClient(config["AzureWebJobsStorage"]);
+        });
+
         // HTTP clients
         services.AddHttpClient("Claude", client =>
         {
@@ -80,6 +87,7 @@ var host = new HostBuilder()
         services.AddSingleton<IMemberPreferencesRepository, CosmosMemberPreferencesRepository>();
         services.AddSingleton<IFamilyProfileRepository, CosmosFamilyProfileRepository>();
         services.AddSingleton<IKidSmsRepository, CosmosKidSmsRepository>();
+        services.AddSingleton<IProcessedMessageRepository, CosmosProcessedMessageRepository>();
 
         // Services
         services.AddSingleton<IClaudeService, ClaudeService>();
@@ -101,6 +109,17 @@ var host = new HostBuilder()
         services.AddSingleton<IEmailMonitoringService, EmailMonitoringService>();
         services.AddSingleton<ISessionCompressionService, SessionCompressionService>();
         services.AddSingleton<IPreferenceDetectionService, PreferenceDetectionService>();
+        services.AddSingleton<IQueueService, AzureStorageQueueService>();
+        services.AddSingleton<ITypingIndicatorService>(sp =>
+        {
+            var logger = sp.GetRequiredService<Microsoft.Extensions.Logging.ILogger<TwilioTypingIndicatorService>>();
+            var httpFactory = sp.GetRequiredService<IHttpClientFactory>();
+            return new TwilioTypingIndicatorService(
+                config["Twilio:AccountSid"] ?? throw new InvalidOperationException("Twilio:AccountSid not configured"),
+                config["Twilio:AuthToken"] ?? throw new InvalidOperationException("Twilio:AuthToken not configured"),
+                httpFactory,
+                logger);
+        });
         services.AddSingleton<ICalendarService>(sp =>
         {
             var graphClient = sp.GetRequiredService<GraphServiceClient>();

@@ -1,7 +1,6 @@
 using System.Net;
 using System.Web;
 using BigDamnAssistant.Core.Models;
-using BigDamnAssistant.Core.Orchestration;
 using BigDamnAssistant.Core.Services;
 using Microsoft.Azure.Functions.Worker;
 using Microsoft.Azure.Functions.Worker.Http;
@@ -11,17 +10,17 @@ namespace BigDamnAssistant.Functions.Functions;
 
 public class WhatsAppWebhookFunction
 {
-    private readonly MessageOrchestrator _orchestrator;
     private readonly IWhatsAppService _whatsAppService;
+    private readonly IQueueService _queueService;
     private readonly ILogger<WhatsAppWebhookFunction> _logger;
 
     public WhatsAppWebhookFunction(
-        MessageOrchestrator orchestrator,
         IWhatsAppService whatsAppService,
+        IQueueService queueService,
         ILogger<WhatsAppWebhookFunction> logger)
     {
-        _orchestrator = orchestrator;
         _whatsAppService = whatsAppService;
+        _queueService = queueService;
         _logger = logger;
     }
 
@@ -30,85 +29,101 @@ public class WhatsAppWebhookFunction
         [HttpTrigger(AuthorizationLevel.Function, "post")] HttpRequestData req,
         CancellationToken cancellationToken)
     {
-        // Always return 200 to Twilio to prevent retries
-        var okResponse = req.CreateResponse(HttpStatusCode.OK);
+        var body = await req.ReadAsStringAsync();
+        if (string.IsNullOrEmpty(body))
+        {
+            _logger.LogWarning("Empty request body from Twilio");
+            return CreateEmptyTwimlResponse(req);
+        }
+
+        // Validate Twilio signature
+        var formData = HttpUtility.ParseQueryString(body);
+        var signature = req.Headers.TryGetValues("X-Twilio-Signature", out var sigValues)
+            ? sigValues.FirstOrDefault() ?? string.Empty
+            : string.Empty;
+
+        var parameters = formData.AllKeys
+            .Where(k => k is not null)
+            .ToDictionary(k => k!, k => formData[k] ?? string.Empty);
+
+        if (!_whatsAppService.ValidateRequest(signature, req.Url.ToString(), parameters))
+        {
+            _logger.LogWarning("Invalid Twilio signature on WhatsApp webhook");
+            var forbidden = req.CreateResponse(HttpStatusCode.Forbidden);
+            return forbidden;
+        }
+
+        // Ignore Twilio delivery status callbacks (outbound statuses like sent/delivered/failed)
+        var messageStatus = formData["MessageStatus"] ?? formData["SmsStatus"] ?? "";
+        if (!string.IsNullOrEmpty(messageStatus)
+            && !messageStatus.Equals("received", StringComparison.OrdinalIgnoreCase))
+        {
+            _logger.LogDebug("Ignoring Twilio status callback: {Status}", messageStatus);
+            return CreateEmptyTwimlResponse(req);
+        }
+
+        // Detect channel from Twilio To field
+        var to = formData["To"] ?? string.Empty;
+        var channel = to.StartsWith("whatsapp:", StringComparison.OrdinalIgnoreCase)
+            ? MessageChannel.WhatsApp
+            : MessageChannel.SMS;
+
+        // Twilio sends "Author" for group messages (the actual sender's number)
+        var author = formData["Author"];
+        var isGroupChat = channel == MessageChannel.WhatsApp && !string.IsNullOrEmpty(author);
+        var from = isGroupChat
+            ? author!.Replace("whatsapp:", "")
+            : formData["From"]?.Replace("whatsapp:", "") ?? string.Empty;
+        var messageBody = formData["Body"] ?? string.Empty;
+        var mediaUrl = formData["MediaUrl0"];
+        var mediaContentType = formData["MediaContentType0"];
+        var messageSid = formData["MessageSid"] ?? string.Empty;
+
+        if (string.IsNullOrEmpty(from))
+        {
+            _logger.LogDebug("Ignoring callback with no From field (likely delivery status)");
+            return CreateEmptyTwimlResponse(req);
+        }
+
+        if (string.IsNullOrEmpty(messageBody) && string.IsNullOrEmpty(mediaUrl))
+        {
+            _logger.LogWarning("Missing Body and MediaUrl in WhatsApp webhook");
+            return CreateEmptyTwimlResponse(req);
+        }
+
+        // Enqueue for async processing
+        var inboundMessage = new InboundMessage
+        {
+            MessageSid = messageSid,
+            From = from,
+            Body = messageBody,
+            Channel = channel,
+            IsGroupChat = isGroupChat,
+            MediaUrl = mediaUrl,
+            MediaContentType = mediaContentType,
+            ReceivedAt = DateTime.UtcNow
+        };
 
         try
         {
-            var body = await req.ReadAsStringAsync();
-            if (string.IsNullOrEmpty(body))
-            {
-                _logger.LogWarning("Empty request body from Twilio");
-                return okResponse;
-            }
-
-            var formData = HttpUtility.ParseQueryString(body);
-
-            // Validate Twilio signature
-            var signature = req.Headers.TryGetValues("X-Twilio-Signature", out var sigValues)
-                ? sigValues.FirstOrDefault() ?? string.Empty
-                : string.Empty;
-
-            var parameters = formData.AllKeys
-                .Where(k => k is not null)
-                .ToDictionary(k => k!, k => formData[k] ?? string.Empty);
-
-            if (!_whatsAppService.ValidateRequest(signature, req.Url.ToString(), parameters))
-            {
-                _logger.LogWarning("Invalid Twilio signature on WhatsApp webhook");
-                return okResponse;
-            }
-
-            // Ignore Twilio delivery status callbacks (outbound statuses like sent/delivered/failed)
-            // Inbound messages have SmsStatus=received which we must NOT filter out
-            var messageStatus = formData["MessageStatus"] ?? formData["SmsStatus"] ?? "";
-            if (!string.IsNullOrEmpty(messageStatus)
-                && !messageStatus.Equals("received", StringComparison.OrdinalIgnoreCase))
-            {
-                _logger.LogDebug("Ignoring Twilio status callback: {Status}", messageStatus);
-                return okResponse;
-            }
-
-            // Detect channel from Twilio To field
-            var to = formData["To"] ?? string.Empty;
-            var channel = to.StartsWith("whatsapp:", StringComparison.OrdinalIgnoreCase)
-                ? MessageChannel.WhatsApp
-                : MessageChannel.SMS;
-
-            // Twilio sends "Author" for group messages (the actual sender's number).
-            // When Author is present, "From" is the group identifier.
-            var author = formData["Author"];
-            var isGroupChat = channel == MessageChannel.WhatsApp && !string.IsNullOrEmpty(author);
-            var from = isGroupChat
-                ? author!.Replace("whatsapp:", "")
-                : formData["From"]?.Replace("whatsapp:", "") ?? string.Empty;
-            var messageBody = formData["Body"] ?? string.Empty;
-
-            // Extract media attachment info
-            var mediaUrl = formData["MediaUrl0"];
-            var mediaContentType = formData["MediaContentType0"];
-
-            if (string.IsNullOrEmpty(from))
-            {
-                _logger.LogDebug("Ignoring callback with no From field (likely delivery status)");
-                return okResponse;
-            }
-
-            // Allow messages with media but no text body
-            if (string.IsNullOrEmpty(messageBody) && string.IsNullOrEmpty(mediaUrl))
-            {
-                _logger.LogWarning("Missing Body and MediaUrl in WhatsApp webhook");
-                return okResponse;
-            }
-
-            await _orchestrator.HandleInboundMessageAsync(
-                from, messageBody, channel, isGroupChat, mediaUrl, mediaContentType, cancellationToken);
+            await _queueService.EnqueueAsync("bda-inbound-messages", inboundMessage, cancellationToken);
+            _logger.LogInformation("Enqueued inbound message {MessageSid} from {From} on {Channel}",
+                messageSid, from, channel);
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Error processing WhatsApp webhook");
+            _logger.LogError(ex, "Failed to enqueue message {MessageSid}", messageSid);
         }
 
-        return okResponse;
+        // Return empty TwiML immediately
+        return CreateEmptyTwimlResponse(req);
+    }
+
+    private static HttpResponseData CreateEmptyTwimlResponse(HttpRequestData req)
+    {
+        var response = req.CreateResponse(HttpStatusCode.OK);
+        response.Headers.Add("Content-Type", "text/xml");
+        response.WriteString("<Response></Response>");
+        return response;
     }
 }
