@@ -84,7 +84,8 @@ public class ClaudeService : IClaudeService
         var memories = await _familyMemoryRepository.GetAllAsync(cancellationToken);
         var preferences = await _memberPreferencesRepository.GetAsync(member.PhoneNumber, cancellationToken);
         var profiles = await _familyProfileRepository.GetAllActiveAsync(cancellationToken);
-        var systemPrompt = BuildSystemPrompt(member, now, memories, preferences, history.SessionSummaries, profiles);
+        var kidContacts = await _kidSmsRepository.GetAllActiveAsync(cancellationToken);
+        var systemPrompt = BuildSystemPrompt(member, now, memories, preferences, history.SessionSummaries, profiles, kidContacts);
         var messages = BuildMessages(history, userMessage);
         var tools = BuildToolDefinitions();
 
@@ -1790,7 +1791,8 @@ public class ClaudeService : IClaudeService
         IReadOnlyList<FamilyMemory>? memories = null,
         MemberPreferences? preferences = null,
         IReadOnlyList<SessionSummary>? sessionSummaries = null,
-        IReadOnlyList<FamilyProfile>? profiles = null)
+        IReadOnlyList<FamilyProfile>? profiles = null,
+        IReadOnlyList<KidSmsUser>? kidContacts = null)
     {
         var prompt = $"""
             You are {_assistantOptions.Name}, a helpful family AI assistant.
@@ -1902,6 +1904,20 @@ public class ClaudeService : IClaudeService
                     prompt += $"Activities: {string.Join(", ", acts)}\n";
                 }
                 if (!string.IsNullOrEmpty(p.Notes)) prompt += $"Notes: {p.Notes}\n";
+
+                // Show kid contact info if registered
+                var kidContact = kidContacts?.FirstOrDefault(k =>
+                    k.LinkedProfileName.Equals(p.Name, StringComparison.OrdinalIgnoreCase));
+                if (kidContact != null)
+                {
+                    var channels = new List<string>();
+                    if (!string.IsNullOrEmpty(kidContact.SmsPhoneNumber))
+                        channels.Add($"SMS watch: {kidContact.SmsPhoneNumber}");
+                    if (!string.IsNullOrEmpty(kidContact.WhatsAppPhoneNumber))
+                        channels.Add($"WhatsApp: {kidContact.WhatsAppPhoneNumber}");
+                    prompt += $"Contact: {string.Join(", ", channels)} (preferred: {kidContact.PreferredChannel})\n";
+                }
+
                 prompt += "\n";
             }
         }
