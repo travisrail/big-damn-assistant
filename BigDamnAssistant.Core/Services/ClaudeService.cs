@@ -295,10 +295,6 @@ public class ClaudeService : IClaudeService
         var events = await _calendarService.GetEventsAsync(from, to, cancellationToken);
 
         _logger.LogInformation("Calendar returned {Count} events between {From} and {To}", events.Count, from, to);
-        foreach (var evt in events)
-        {
-            _logger.LogInformation("  Event: '{Subject}' at {Start}", evt.Subject, evt.Start);
-        }
 
         if (events.Count == 0)
             return "No events found in the specified date range.";
@@ -1855,7 +1851,11 @@ public class ClaudeService : IClaudeService
             You have access to the family calendar and the shared BDA email inbox.
             Use the provided tools to check the calendar, create events, and send emails — do not guess or make up data.
             When asked about calendar events, always use the get_calendar_events tool to check.
-            When searching for a specific event by name, search a wide range (at least 6 months ahead) to ensure you find it.
+            Use the narrowest date range that makes sense for the request:
+            - "What's on today/this week?" → search just that day or week
+            - "When is the dentist appointment?" → search 2-3 months ahead
+            - "Update the martial arts location" → search 2-4 weeks ahead to find the next occurrence
+            - Only use 6+ month ranges when explicitly asked about long-term planning
             If you don't find an event in your initial search, try a broader date range before telling the user it doesn't exist.
             Calendar events may be prefixed with a family member's name (e.g., "Teddy - Miguel's Birthday Party" or "Oscar - Dentist").
             When searching for an event, look for partial matches anywhere in the event subject, not just exact title matches.
