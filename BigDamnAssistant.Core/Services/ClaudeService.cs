@@ -94,7 +94,7 @@ public class ClaudeService : IClaudeService
             var request = new ClaudeRequest
             {
                 Model = Model,
-                MaxTokens = 1024,
+                MaxTokens = 4096,
                 System = systemPrompt,
                 Messages = messages,
                 Tools = tools
@@ -123,7 +123,7 @@ public class ClaudeService : IClaudeService
                     continue;
                 }
 
-                var text = result?.Content?.FirstOrDefault(b => b.Type == "text")?.Text;
+                var text = string.Join("", result?.Content?.Where(b => b.Type == "text").Select(b => b.Text) ?? []);
 
                 if (string.IsNullOrEmpty(text))
                 {
@@ -194,7 +194,7 @@ public class ClaudeService : IClaudeService
                     continue;
                 }
 
-                var text = result?.Content?.FirstOrDefault(b => b.Type == "text")?.Text;
+                var text = string.Join("", result?.Content?.Where(b => b.Type == "text").Select(b => b.Text) ?? []);
 
                 if (string.IsNullOrEmpty(text))
                     return "Hmm, I got stuck. Try asking again!";
