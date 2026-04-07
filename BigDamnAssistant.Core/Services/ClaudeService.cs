@@ -1797,7 +1797,7 @@ public class ClaudeService : IClaudeService
         var prompt = $"""
             You are {_assistantOptions.Name}, a helpful family AI assistant.
             You are currently speaking with {member.Name}.
-            Today is {localNow:dddd, MMMM d, yyyy}. Local time is {localNow:h:mm tt} ({member.Timezone}).
+            Today is {localNow:dddd, MMMM d, yyyy}. Local time is {localNow:h:mm tt} ({member.Timezone}).{(string.IsNullOrEmpty(member.Location) ? "" : $"\n            Location: {member.Location}.")}
             You have access to the family calendar and the shared BDA email inbox.
             Use the provided tools to check the calendar, create events, and send emails — do not guess or make up data.
             When asked about calendar events, always use the get_calendar_events tool to check.

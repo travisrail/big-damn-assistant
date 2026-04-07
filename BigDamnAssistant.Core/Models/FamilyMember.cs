@@ -11,4 +11,5 @@ public class FamilyMember
     public List<string> Nicknames { get; set; } = new();
     public string Role { get; set; } = "member";
     public string Timezone { get; set; } = "America/Chicago";
+    public string Location { get; set; } = string.Empty;
 }
